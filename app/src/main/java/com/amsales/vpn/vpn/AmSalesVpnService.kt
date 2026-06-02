@@ -15,6 +15,11 @@ import androidx.core.app.NotificationCompat
 import com.amsales.vpn.R
 import com.amsales.vpn.data.Repository
 import com.amsales.vpn.ui.MainActivity
+import io.nekohasekai.libbox.CommandServer
+import io.nekohasekai.libbox.CommandServerHandler
+import io.nekohasekai.libbox.Libbox
+import io.nekohasekai.libbox.SetupOptions
+import io.nekohasekai.libbox.SystemProxyStatus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -23,26 +28,23 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * VpnService — текущая версия:
- *   ✅ Поднимает TUN-интерфейс
- *   ✅ Применяет split tunneling по приложениям
- *   ✅ Показывает foreground notification
- *   ✅ Broadcast'ит состояние в UI (off / connecting / on / error)
- *   ⚠ НЕ запускает реальный sing-box-движок — это ещё в работе.
+ * VpnService с реальным sing-box-движком внутри (libbox).
  *
- * Что нужно добавить для настоящего VPN:
- *   - Подключить libbox AAR (sing-box как Android-библиотека)
- *   - Реализовать PlatformInterface
- *   - Вызвать Libbox.newService(config, platform).start()
+ * Поток запуска:
+ *   1. Repo даёт активный VlessKey
+ *   2. Libbox.setup(basePath/workingPath/tempPath) — кладём данные в files/sing-box
+ *   3. SingBoxConfig.build(key, repo) → JSON
+ *   4. AmSalesPlatformInterface — мост, отдающий TUN-fd через openTun()
+ *   5. Libbox.newCommandServer(handler, platform) + server.start()
+ *   6. server.startOrReloadService(json, null) — запуск sing-box-инстанса
+ *   7. broadcast "on"
  *
- * Прежняя попытка через standalone-sing-box-binary + file_descriptor
- * провалилась: standalone sing-box CLI не умеет принимать TUN-fd от
- * чужого процесса. Нужна именно AAR-библиотека.
- *
- * Пока этот код стоит, можно проверить весь UI, профили, QR, подписки,
- * split tunneling — всё кроме самой передачи трафика.
+ * Stop:
+ *   - server.closeService(); server.close(); закрываем TUN.
  */
 class AmSalesVpnService : VpnService() {
 
@@ -59,7 +61,9 @@ class AmSalesVpnService : VpnService() {
     @Volatile var isRunning: Boolean = false
         private set
 
-    private var tun: ParcelFileDescriptor? = null
+    private val starting = AtomicBoolean(false)
+    private var commandServer: CommandServer? = null
+    private var platformInterface: AmSalesPlatformInterface? = null
     private var statsJob: Job? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var currentTag: String = ""
@@ -68,8 +72,8 @@ class AmSalesVpnService : VpnService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_CONNECT -> connect()
-            ACTION_DISCONNECT -> disconnect()
+            ACTION_CONNECT -> scope.launch { connect() }
+            ACTION_DISCONNECT -> scope.launch { disconnect() }
         }
         return START_STICKY
     }
@@ -78,68 +82,100 @@ class AmSalesVpnService : VpnService() {
 
     override fun onRevoke() {
         Log.i(TAG, "VPN revoked")
-        disconnect()
+        scope.launch { disconnect() }
         super.onRevoke()
     }
 
     override fun onDestroy() {
-        disconnect()
+        scope.launch { disconnect() }
         scope.cancel()
         super.onDestroy()
     }
 
-    private fun connect() {
-        if (isRunning) return
+    private suspend fun connect() {
+        if (isRunning || !starting.compareAndSet(false, true)) return
 
-        val repo = Repository(applicationContext)
-        val key = repo.current()?.key ?: run {
+        try {
+            val repo = Repository(applicationContext)
+            val key = repo.current()?.key ?: run {
+                VpnState.broadcast(applicationContext, "error",
+                    error = "Сначала добавьте ключ на вкладке Серверы")
+                stopSelf()
+                return
+            }
+            currentTag = key.tag
+            VpnState.broadcast(applicationContext, "connecting", tag = currentTag)
+
+            // 1. setup путей
+            val baseDir = File(applicationContext.filesDir, "sing-box").apply { mkdirs() }
+            val workDir = File(baseDir, "work").apply { mkdirs() }
+            val tmpDir = File(applicationContext.cacheDir, "sing-box").apply { mkdirs() }
+            val setup = SetupOptions().apply {
+                basePath = baseDir.absolutePath
+                workingPath = workDir.absolutePath
+                tempPath = tmpDir.absolutePath
+            }
+            Libbox.setup(setup)
+            Log.i(TAG, "Libbox.setup OK, version=${Libbox.version()}")
+
+            // 2. PlatformInterface — мост из Go в наш VpnService
+            val platform = AmSalesPlatformInterface(this, repo.blacklistApps.toSet())
+            platformInterface = platform
+
+            // 3. CommandServer — управляет жизненным циклом sing-box
+            val handler = object : CommandServerHandler {
+                override fun getSystemProxyStatus(): SystemProxyStatus? = null
+                override fun serviceReload() { Log.i(TAG, "serviceReload requested") }
+                override fun serviceStop() {
+                    Log.i(TAG, "serviceStop requested from sing-box")
+                    scope.launch { disconnect() }
+                }
+                override fun setSystemProxyEnabled(enabled: Boolean) {}
+                override fun writeDebugMessage(message: String?) {
+                    if (!message.isNullOrEmpty()) Log.d("sing-box", message)
+                }
+            }
+            val server = Libbox.newCommandServer(handler, platform)
+            server.start()
+            commandServer = server
+            Log.i(TAG, "CommandServer started")
+
+            // 4. собираем JSON-конфиг и запускаем сервис
+            val json = SingBoxConfig.build(key, repo, TUN_MTU)
+            Log.d(TAG, "sing-box config: ${json.take(500)}…")
+
+            try {
+                Libbox.checkConfig(json)
+            } catch (e: Exception) {
+                Log.e(TAG, "checkConfig failed: ${e.message}")
+                VpnState.broadcast(applicationContext, "error",
+                    error = "Невалидный конфиг: ${e.message}")
+                cleanup()
+                stopSelf()
+                return
+            }
+
+            server.startOrReloadService(json, null)
+            Log.i(TAG, "sing-box service started")
+
+            // 5. foreground notification + статистика
+            startForeground(NOTIF_ID, buildNotification(currentTag))
+            isRunning = true
+
+            rxBaseline = TrafficStats.getUidRxBytes(applicationInfo.uid).coerceAtLeast(0)
+            txBaseline = TrafficStats.getUidTxBytes(applicationInfo.uid).coerceAtLeast(0)
+            startStatsWatcher()
+
+            VpnState.broadcast(applicationContext, "on", tag = currentTag)
+        } catch (e: Throwable) {
+            Log.e(TAG, "connect failed", e)
             VpnState.broadcast(applicationContext, "error",
-                error = "Сначала добавьте ключ на вкладке Серверы")
+                error = e.message ?: "Ошибка запуска VPN")
+            cleanup()
             stopSelf()
-            return
+        } finally {
+            starting.set(false)
         }
-        currentTag = key.tag
-        VpnState.broadcast(applicationContext, "connecting", tag = currentTag)
-
-        val builder = Builder()
-            .setSession(getString(R.string.app_name))
-            .setMtu(TUN_MTU)
-            .addAddress(TUN_ADDRESS, 30)
-            .addRoute("0.0.0.0", 0)
-            .addDnsServer("1.1.1.1")
-            .addDnsServer("77.88.8.8")
-
-        for (pkg in repo.blacklistApps) {
-            try { builder.addDisallowedApplication(pkg) }
-            catch (e: Exception) { Log.w(TAG, "skip $pkg: ${e.message}") }
-        }
-        try { builder.addDisallowedApplication(packageName) }
-        catch (_: Exception) {}
-
-        tun = builder.establish()
-        if (tun == null) {
-            Log.e(TAG, "TUN не поднялся")
-            VpnState.broadcast(applicationContext, "error", error = "Не удалось поднять TUN")
-            stopSelf()
-            return
-        }
-        Log.i(TAG, "TUN OK fd=${tun?.fd}, ключ=$currentTag")
-
-        startForeground(NOTIF_ID, buildNotification(currentTag))
-        isRunning = true
-
-        // ⚠ Реальный sing-box engine пока не запущен — нужен libbox AAR.
-        // Текущая сборка валидна как «каркас VPN»: TUN поднят, split
-        // tunneling применён, blacklist приложения идут напрямую. Но
-        // остальной трафик уходит в TUN и теряется. По прибытию libbox —
-        // здесь будет Libbox.newService(config, platform).start().
-        Log.w(TAG, "sing-box engine ещё не интегрирован — трафик в туннеле теряется")
-
-        rxBaseline = TrafficStats.getUidRxBytes(applicationInfo.uid).coerceAtLeast(0)
-        txBaseline = TrafficStats.getUidTxBytes(applicationInfo.uid).coerceAtLeast(0)
-        startStatsWatcher()
-
-        VpnState.broadcast(applicationContext, "on", tag = currentTag)
     }
 
     private fun startStatsWatcher() {
@@ -159,19 +195,28 @@ class AmSalesVpnService : VpnService() {
         }
     }
 
-    private fun disconnect() {
-        if (!isRunning && tun == null) return
+    private suspend fun disconnect() {
+        if (!isRunning && commandServer == null) return
         try {
             statsJob?.cancel(); statsJob = null
-            tun?.close(); tun = null
+            cleanup()
             stopForeground(STOP_FOREGROUND_REMOVE)
             isRunning = false
             VpnState.broadcast(applicationContext, "off")
-            stopSelf()
             Log.i(TAG, "disconnected")
+            stopSelf()
         } catch (e: Exception) {
             Log.e(TAG, "ошибка при отключении", e)
         }
+    }
+
+    private fun cleanup() {
+        try { commandServer?.closeService() } catch (e: Exception) { Log.w(TAG, "closeService: ${e.message}") }
+        try { commandServer?.close() } catch (e: Exception) { Log.w(TAG, "server.close: ${e.message}") }
+        commandServer = null
+
+        try { platformInterface?.tunFd?.close() } catch (_: Exception) {}
+        platformInterface = null
     }
 
     private fun buildNotification(tag: String): Notification {

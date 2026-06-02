@@ -6,21 +6,22 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Генерация JSON-конфига для sing-box (вариант 1.13+).
+ * Генерация sing-box-конфига для libbox-embedded режима.
  *
- * Конфиг работает в режиме TUN-inbound: sing-box получает TUN-fd от
- * VpnService через флаг -t (или конфиг с file_descriptor). В нашем случае
- * проще — sing-box создаёт TUN сам, но мы наследуем FD от VpnService.
+ * libbox запускает sing-box внутри нашего процесса. TUN-устройство при
+ * этом поднимает наш PlatformInterface.openTun() — поэтому НЕ передаём
+ * file_descriptor в JSON и обязательно ставим auto_route=true, чтобы
+ * sing-box вызвал openTun платформенного интерфейса.
  *
- * Заворачиваем туннелем весь трафик, маршрутизация:
- *   - До нашего VLESS-сервера (host из ключа) → direct
- *   - .ru-домены / russian geoip → direct (если routeRuDirect=true)
- *   - bypass-сайты (gosuslugi.ru etc.) → direct
- *   - всё остальное → proxy (vless)
+ * Маршрутизация:
+ *   - До VLESS-сервера (host из ключа) — direct
+ *   - bypass-сайты пользователя — direct
+ *   - .ru-домены — direct (если routeRuDirect=true)
+ *   - всё остальное — proxy (vless)
  */
 object SingBoxConfig {
 
-    fun build(key: VlessKey, settings: Repository, tunFd: Int, tunMtu: Int): String {
+    fun build(key: VlessKey, settings: Repository, tunMtu: Int): String {
 
         // Outbound vless
         val vless = JSONObject().apply {
@@ -30,10 +31,7 @@ object SingBoxConfig {
             put("server_port", key.port)
             put("uuid", key.uuid)
             put("packet_encoding", "xudp")
-            // tcp_fast_open ускоряет установление коннекта на мобильных сетях
-            put("tcp_fast_open", true)
 
-            // TLS + REALITY (если указано)
             if (key.security != "none" && key.security.isNotEmpty()) {
                 val tls = JSONObject().apply {
                     put("enabled", true)
@@ -55,7 +53,6 @@ object SingBoxConfig {
                 put("tls", tls)
             }
 
-            // Transport (ws / grpc / tcp)
             when (key.type) {
                 "ws" -> {
                     val tr = JSONObject()
@@ -69,23 +66,18 @@ object SingBoxConfig {
                 "grpc" -> {
                     put("transport", JSONObject().put("type", "grpc"))
                 }
-                // tcp — без явного transport
             }
         }
 
-        // Inbound TUN
+        // Inbound TUN — без file_descriptor (libbox вызовет openTun через PlatformInterface)
         val tun = JSONObject().apply {
             put("type", "tun")
             put("tag", "tun-in")
-            put("interface_name", "amsales0")
-            put("address", JSONArray().apply {
-                put(AmSalesVpnService.TUN_ADDRESS + "/30")
-            })
+            put("address", JSONArray().put("${AmSalesVpnService.TUN_ADDRESS}/30"))
             put("mtu", tunMtu)
-            // file_descriptor — наш TUN-fd от VpnService.Builder.establish()
-            put("file_descriptor", tunFd)
-            put("auto_route", false)   // маршруты уже настроены VpnService
-            put("stack", "gvisor")     // user-mode TCP/IP стек — надёжно
+            put("auto_route", true)        // важнo: триггерит вызов platform.openTun()
+            put("strict_route", false)
+            put("stack", "gvisor")
         }
 
         // DNS
@@ -109,12 +101,11 @@ object SingBoxConfig {
         rules.put(JSONObject()
             .put("protocol", "dns")
             .put("action", "hijack-dns"))
-        // Исключение для самого VPN-сервера (нельзя гонять через себя же)
+        // Exclude самого VPN-сервера
         rules.put(JSONObject()
             .put("ip_cidr", JSONArray().put("${key.host}/32"))
             .put("action", "route")
             .put("outbound", "direct"))
-        // Bypass-сайты пользователя
         val bypass = settings.bypassSites
         if (bypass.isNotEmpty()) {
             val bypassJson = JSONArray()
@@ -124,7 +115,6 @@ object SingBoxConfig {
                 .put("action", "route")
                 .put("outbound", "direct"))
         }
-        // .ru-домены напрямую
         if (settings.routeRuDirect) {
             rules.put(JSONObject()
                 .put("domain_suffix", ".ru")
@@ -139,10 +129,6 @@ object SingBoxConfig {
             put("default_domain_resolver", JSONObject().put("server", "local"))
         }
 
-        // direct outbound. Раньше тут стоял tls_fragment, но в sing-box
-        // 1.13.12 этот параметр ещё не работает — провалит парсинг конфига
-        // и sing-box упадёт с FATAL сразу при старте. Включим в будущей
-        // версии когда обновим бинарь до 1.14.
         val direct = JSONObject().apply {
             put("type", "direct")
             put("tag", "direct")

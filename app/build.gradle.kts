@@ -23,13 +23,9 @@ android {
         }
     }
 
-    // sing-box-бинарь лежит в jniLibs/<abi>/libsing-box.so — это «бинарь,
-    // не библиотека». Чтобы Android при установке распаковал его на диск
-    // (а не оставил внутри APK), просим extractNativeLibs=true.
+    // libbox.aar содержит libgojni.so для arm64/armv7 — упаковываем
+    // штатно. Никаких standalone-бинарей в jniLibs больше нет.
     packaging {
-        jniLibs {
-            useLegacyPackaging = true   // = extractNativeLibs=true в манифесте
-        }
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
     }
 
@@ -95,4 +91,9 @@ dependencies {
 
     // ZXing — для генерации QR
     implementation("com.google.zxing:core:3.5.3")
+
+    // libbox — sing-box как Android-библиотека (JitPack)
+    // Содержит Libbox.newCommandServer / CommandServer.startOrReloadService
+    // + PlatformInterface (15 методов) — это и есть наш реальный движок.
+    implementation("com.github.singbox-android:libbox:1.13.12")
 }
