@@ -1,0 +1,21 @@
+# Сборка
+build/
+*.apk
+*.aab
+*.dex
+
+# Gradle (кэш и логи)
+.gradle/
+local.properties
+
+# Android SDK
+.cxx/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Файлы ОС
+.DS_Store
+Thumbs.db

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Палитра AM.SALES (та же что в десктопе): зелёный лайм #9FE812 поверх
+         глубокого чёрно-зелёного фона. -->
+    <color name="accent">#9FE812</color>
+    <color name="text_hi">#F4F6F0</color>
+    <color name="text_lo">#7E8A72</color>
+    <color name="bg_top">#08110A</color>
+    <color name="bg_mid">#060806</color>
+    <color name="bg_bottom">#0A0E08</color>
+
+    <!-- Для статус-бара -->
+    <color name="status_bar">#060806</color>
+</resources>

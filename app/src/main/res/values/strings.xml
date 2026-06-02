@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AM.SALES VPN</string>
+
+    <!-- Главный экран -->
+    <string name="status_off">Отключено</string>
+    <string name="status_connecting">Подключение…</string>
+    <string name="status_on">Подключено</string>
+    <string name="tap_to_connect">Нажмите кнопку, чтобы подключиться</string>
+
+    <!-- Табы -->
+    <string name="tab_vpn">VPN</string>
+    <string name="tab_apps">Приложения</string>
+    <string name="tab_options">Опции</string>
+    <string name="tab_about">О программе</string>
+
+    <!-- Вкладка Приложения -->
+    <string name="apps_title">Приложения мимо VPN</string>
+    <string name="apps_subtitle">Отмеченные приложения ходят напрямую, без туннеля. Удобно для Озона/ВБ/Госуслуг.</string>
+    <string name="apps_search_hint">Поиск</string>
+    <string name="apps_loading">Загрузка списка…</string>
+
+    <!-- Уведомление foreground-сервиса -->
+    <string name="notif_channel_name">VPN-туннель</string>
+    <string name="notif_channel_desc">Уведомление о работающем VPN-сервисе</string>
+    <string name="notif_title">AM.SALES VPN активен</string>
+    <string name="notif_text">Подключено · %1$s</string>
+    <string name="notif_disconnect">Отключить</string>
+
+    <!-- О программе -->
+    <string name="about_title">AM.SALES VPN для Android</string>
+    <string name="about_version">Версия %1$s</string>
+    <string name="about_desc">VLESS+REALITY через sing-box. Сервер: 78.17.103.241 + Cloudflare Worker для DPI-обхода.</string>
+</resources>

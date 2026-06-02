@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Базовая тема. Compose сам всё рисует — здесь только статус-бар и
+         поведение Activity. -->
+    <style name="Theme.AmSalesVPN" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@color/status_bar</item>
+        <item name="android:windowBackground">@color/bg_mid</item>
+        <item name="android:navigationBarColor">@color/bg_mid</item>
+        <item name="android:windowLightStatusBar" tools:targetApi="m">false</item>
+        <item name="android:windowLightNavigationBar" tools:targetApi="o_mr1">false</item>
+    </style>
+
+</resources>
