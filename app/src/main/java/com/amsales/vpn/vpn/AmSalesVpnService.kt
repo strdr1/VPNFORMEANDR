@@ -12,7 +12,7 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.amsales.vpn.R
-import com.amsales.vpn.data.Settings
+import com.amsales.vpn.data.Repository
 import com.amsales.vpn.data.VlessKey
 import com.amsales.vpn.ui.MainActivity
 import kotlinx.coroutines.CoroutineScope
@@ -22,24 +22,26 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import java.io.File
+import java.io.IOException
 
 /**
- * VPN-сервис на основе VpnService.
+ * VpnService — поднимает TUN-интерфейс + запускает sing-box-бинарь,
+ * который читает TUN-fd и проксирует трафик через VLESS.
  *
- * Что делает при ACTION_CONNECT:
- *   1. Берёт активный VLESS-ключ из Settings
- *   2. Берёт чёрный список приложений из Settings → передаёт VpnService.Builder
- *      через addDisallowedApplication() — эти приложения ходят мимо TUN.
- *   3. Поднимает TUN-интерфейс
- *   4. Запускает sing-box (бинарь в /data/data/.../files/sing-box) с конфигом
- *      vless+REALITY/WS — он читает TUN и проксирует в VPN.
- *   5. Показывает foreground-уведомление "AM.SALES VPN активен"
+ * Жизненный цикл:
+ *   ACTION_CONNECT:
+ *     1. Берём активный ключ из Repository (если нет — выходим)
+ *     2. Применяем split tunneling через addDisallowedApplication()
+ *     3. Поднимаем TUN
+ *     4. Распаковываем sing-box.so → cacheDir/sing-box, делаем executable
+ *     5. Генерируем конфиг (SingBoxConfig.build) → cacheDir/sing-box-config.json
+ *     6. Запускаем sing-box-процесс с этим конфигом
+ *     7. Foreground notification
  *
- * При ACTION_DISCONNECT — всё аккуратно глушит.
- *
- * ВАЖНО: реальный запуск sing-box-бинаря — это этап 2. На этапе 1 мы
- * поднимаем TUN, но процесс sing-box не стартуем (пока бинарь не положен
- * в assets). Это правильный путь — UI и каркас уже работают.
+ *   ACTION_DISCONNECT:
+ *     1. SIGTERM sing-box (через Process.destroy())
+ *     2. Закрываем TUN-fd
+ *     3. Снимаем notification
  */
 class AmSalesVpnService : VpnService() {
 
@@ -47,7 +49,6 @@ class AmSalesVpnService : VpnService() {
         const val ACTION_CONNECT = "com.amsales.vpn.CONNECT"
         const val ACTION_DISCONNECT = "com.amsales.vpn.DISCONNECT"
         const val TUN_ADDRESS = "172.19.0.1"
-        const val TUN_ROUTE_V4 = "0.0.0.0"
         const val TUN_MTU = 1500
         private const val TAG = "AmSalesVpnService"
         private const val NOTIF_CHANNEL = "amsales_vpn_channel"
@@ -58,6 +59,7 @@ class AmSalesVpnService : VpnService() {
         private set
 
     private var tun: ParcelFileDescriptor? = null
+    private var singBoxProcess: Process? = null
     private var singBoxJob: Job? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var currentTag: String = ""
@@ -74,7 +76,7 @@ class AmSalesVpnService : VpnService() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onRevoke() {
-        Log.i(TAG, "VPN revoked by system (другое VPN-приложение перехватило)")
+        Log.i(TAG, "VPN revoked — другое приложение перехватило")
         disconnect()
         super.onRevoke()
     }
@@ -85,69 +87,58 @@ class AmSalesVpnService : VpnService() {
         super.onDestroy()
     }
 
-    // ── connect / disconnect ────────────────────────────────────────────
+    // ── Connect ─────────────────────────────────────────────────────────
 
     private fun connect() {
-        if (isRunning) {
-            Log.i(TAG, "уже подключён")
+        if (isRunning) return
+
+        val repo = Repository(applicationContext)
+        val key = repo.current()?.key ?: run {
+            Log.e(TAG, "нет активного ключа — добавьте сервер на вкладке Серверы")
             return
         }
-
-        val settings = Settings(applicationContext)
-        settings.ensureDefaults()
-
-        val keys = settings.keys.mapNotNull { VlessKey.parse(it) }
-        if (keys.isEmpty()) {
-            Log.e(TAG, "нет ключей")
-            return
-        }
-        val key = keys.getOrNull(settings.currentKeyIndex) ?: keys.first()
         currentTag = key.tag
 
-        // 1) Строим TUN-интерфейс
+        // 1) Поднимаем TUN
         val builder = Builder()
             .setSession(getString(R.string.app_name))
             .setMtu(TUN_MTU)
             .addAddress(TUN_ADDRESS, 30)
-            .addRoute(TUN_ROUTE_V4, 0)
+            .addRoute("0.0.0.0", 0)
             .addDnsServer("1.1.1.1")
             .addDnsServer("77.88.8.8")
 
-        // 2) Split tunneling: чёрный список приложений → addDisallowedApplication
-        val blacklist = settings.blacklistApps
+        // Split tunneling: исключаем blacklist + сами себя (антизацикливание)
+        val blacklist = repo.blacklistApps
         for (pkg in blacklist) {
-            try {
-                builder.addDisallowedApplication(pkg)
-            } catch (e: Exception) {
-                Log.w(TAG, "не могу исключить пакет '$pkg': ${e.message}")
-            }
+            try { builder.addDisallowedApplication(pkg) }
+            catch (e: Exception) { Log.w(TAG, "не могу исключить '$pkg': ${e.message}") }
         }
-        // Сами себя — обязательно мимо туннеля, иначе sing-box не сможет
-        // достучаться до VPN-сервера (закольцовка).
-        try {
-            builder.addDisallowedApplication(packageName)
-        } catch (e: Exception) { /* ignore */ }
+        try { builder.addDisallowedApplication(packageName) }
+        catch (e: Exception) { /* ignore */ }
 
         tun = builder.establish()
         if (tun == null) {
-            Log.e(TAG, "не удалось поднять TUN")
+            Log.e(TAG, "TUN не поднялся")
             return
         }
-        Log.i(TAG, "TUN поднят, fd=${tun?.fd}, ключ=$currentTag, blacklist=${blacklist.size}")
+        Log.i(TAG, "TUN OK fd=${tun?.fd}, ключ=$currentTag, blacklist=${blacklist.size}")
 
-        // 3) Запуск sing-box (этап 2). Пока заглушка.
-        startSingBox(key)
+        // 2) Запускаем sing-box
+        startSingBox(key, repo)
 
-        // 4) Foreground-уведомление
+        // 3) Foreground notification
         startForeground(NOTIF_ID, buildNotification(currentTag))
         isRunning = true
     }
 
     private fun disconnect() {
-        if (!isRunning && tun == null) return
+        if (!isRunning && tun == null && singBoxProcess == null) return
         try {
             singBoxJob?.cancel()
             singBoxJob = null
+            singBoxProcess?.destroy()
+            singBoxProcess = null
             tun?.close()
             tun = null
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -159,17 +150,53 @@ class AmSalesVpnService : VpnService() {
         }
     }
 
+    // ── sing-box: распаковка бинаря + запуск ───────────────────────────
+
     /**
-     * Запуск sing-box-бинаря. На этапе 1 — НЕ запускаем (бинаря ещё нет в
-     * assets, надо подложить). На этапе 2 — раскомментируем код и положим
-     * бинарь в assets/sing-box-arm64 + assets/sing-box-arm32.
+     * Подготовка sing-box: в jniLibs он лежит как libsing-box.so. При
+     * установке Android извлекает его в getApplicationInfo().nativeLibraryDir
+     * с executable-битом (это критично — обычные файлы из assets не
+     * получают +x). Возвращаем путь к нему.
      */
-    private fun startSingBox(key: VlessKey) {
+    private fun ensureSingBoxBinary(): File {
+        val libDir = applicationInfo.nativeLibraryDir
+        val singBox = File(libDir, "libsing-box.so")
+        if (!singBox.exists()) {
+            throw IOException("libsing-box.so не найден в $libDir")
+        }
+        return singBox
+    }
+
+    private fun startSingBox(key: VlessKey, repo: Repository) {
+        val tunFd = tun?.fd ?: return
+
         singBoxJob = scope.launch {
-            // val singBoxPath = ensureSingBoxBinary()
-            // val configPath = SingBoxConfig.build(applicationContext, key, tun!!.fd)
-            // ProcessBuilder(singBoxPath, "run", "-c", configPath).start()
-            Log.i(TAG, "[stub] sing-box запустился бы здесь (этап 2)")
+            try {
+                val singBox = ensureSingBoxBinary()
+                val configFile = File(cacheDir, "sing-box-config.json")
+                configFile.writeText(SingBoxConfig.build(key, repo, tunFd, TUN_MTU))
+                Log.i(TAG, "config: ${configFile.absolutePath}")
+
+                val pb = ProcessBuilder(singBox.absolutePath, "run", "-c", configFile.absolutePath)
+                    .redirectErrorStream(true)
+                    .directory(cacheDir)
+                val proc = pb.start()
+                singBoxProcess = proc
+                Log.i(TAG, "sing-box запущен pid=$proc")
+
+                // Читаем stdout/stderr в лог — если упадёт, увидим причину.
+                proc.inputStream.bufferedReader().useLines { lines ->
+                    lines.forEach { Log.i("sing-box", it) }
+                }
+
+                // Если процесс умер сам — выключаем VPN-сервис.
+                val code = proc.waitFor()
+                Log.w(TAG, "sing-box завершился, exit=$code")
+                disconnect()
+            } catch (e: Exception) {
+                Log.e(TAG, "не удалось запустить sing-box", e)
+                disconnect()
+            }
         }
     }
 

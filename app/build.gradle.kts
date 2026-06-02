@@ -14,6 +14,23 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0.0"
+
+        // Собираем APK только для ARM (arm64 + armv7). На x86-эмуляторе
+        // запускать смысла нет — у юзера телефоны.
+        ndk {
+            //noinspection ChromeOsAbiSupport
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
+    }
+
+    // sing-box-бинарь лежит в jniLibs/<abi>/libsing-box.so — это «бинарь,
+    // не библиотека». Чтобы Android при установке распаковал его на диск
+    // (а не оставил внутри APK), просим extractNativeLibs=true.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true   // = extractNativeLibs=true в манифесте
+        }
+        resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
     }
 
     buildTypes {
@@ -41,10 +58,6 @@ android {
 
     buildFeatures {
         compose = true
-    }
-
-    packaging {
-        resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
     }
 }
 
