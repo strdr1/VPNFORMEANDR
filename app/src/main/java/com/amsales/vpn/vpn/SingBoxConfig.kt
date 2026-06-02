@@ -139,16 +139,13 @@ object SingBoxConfig {
             put("default_domain_resolver", JSONObject().put("server", "local"))
         }
 
-        // direct outbound: с TLS-фрагментацией если включён zapret-режим
+        // direct outbound. Раньше тут стоял tls_fragment, но в sing-box
+        // 1.13.12 этот параметр ещё не работает — провалит парсинг конфига
+        // и sing-box упадёт с FATAL сразу при старте. Включим в будущей
+        // версии когда обновим бинарь до 1.14.
         val direct = JSONObject().apply {
             put("type", "direct")
             put("tag", "direct")
-            if (settings.useZapret) {
-                // TLS fragment — режет ClientHello на куски, DPI не успевает
-                // распознать SNI и не блокирует. Аналог GoodbyeDPI/zapret.
-                put("tls_fragment", true)
-                put("tls_fragment_fallback_delay", "500ms")
-            }
         }
 
         val root = JSONObject().apply {

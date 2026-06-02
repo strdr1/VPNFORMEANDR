@@ -11,6 +11,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Apps
+import androidx.compose.material.icons.outlined.BugReport
 import androidx.compose.material.icons.outlined.ChevronLeft
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.Info
@@ -77,7 +78,8 @@ fun MainScreen(
                     1 -> ServersTab()
                     2 -> AppsTab()
                     3 -> OptionsTab()
-                    4 -> AboutTab()
+                    4 -> DiagnosticsTab()
+                    5 -> AboutTab()
                 }
             }
         }
@@ -92,7 +94,8 @@ private fun BottomBar(active: Int, onSelect: (Int) -> Unit) {
             Triple(1, Icons.Outlined.Dns,             R.string.tab_servers),
             Triple(2, Icons.Outlined.Apps,            R.string.tab_apps),
             Triple(3, Icons.Outlined.Settings,        R.string.tab_options),
-            Triple(4, Icons.Outlined.Info,            R.string.tab_about),
+            Triple(4, Icons.Outlined.BugReport,       R.string.tab_diag),
+            Triple(5, Icons.Outlined.Info,            R.string.tab_about),
         )
         items.forEach { (idx, icon, lbl) ->
             NavigationBarItem(
