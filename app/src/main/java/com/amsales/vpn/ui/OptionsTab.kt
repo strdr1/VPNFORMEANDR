@@ -42,10 +42,10 @@ fun OptionsTab() {
     val clipboard = LocalClipboardManager.current
     var routeRu by remember { mutableStateOf(repo.routeRuDirect) }
     var useZapret by remember { mutableStateOf(repo.useZapret) }
+    var autoBoot by remember { mutableStateOf(repo.autoConnectOnBoot) }
     var tgLink by remember { mutableStateOf(repo.tgProxyLink) }
     var bypassSites by remember { mutableStateOf(repo.bypassSites) }
     var newSite by remember { mutableStateOf("") }
-    var cfStatus by remember { mutableStateOf("Не проверялось") }
 
     Column(
         Modifier
@@ -69,13 +69,23 @@ fun OptionsTab() {
         }
         Divider()
 
-        // Обход DPI (zapret) — заглушка
+        // Обход DPI (zapret)
         ToggleRow(
             title = "Обход DPI (zapret)",
-            subtitle = "Будет добавлено в одной из следующих версий",
+            subtitle = "Маскирует TLS-handshake для трафика, идущего мимо VPN",
             checked = useZapret
         ) {
             useZapret = it; repo.useZapret = it
+        }
+        Divider()
+
+        // Авто-подключение при старте Android
+        ToggleRow(
+            title = "Авто-подключение при загрузке",
+            subtitle = "Запускать VPN сразу после старта телефона",
+            checked = autoBoot
+        ) {
+            autoBoot = it; repo.autoConnectOnBoot = it
         }
         Divider()
 

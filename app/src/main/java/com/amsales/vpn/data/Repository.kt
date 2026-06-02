@@ -40,6 +40,25 @@ class Repository(private val context: Context) {
         return true
     }
 
+    /** Добавляет сразу пачку — для импорта подписки. Дубли пропускаются. */
+    fun addKeys(uris: List<String>): Int {
+        val current = store.keys.toMutableList()
+        var added = 0
+        for (uri in uris) {
+            if (VlessKey.parse(uri) == null) continue
+            if (uri in current) continue
+            current += uri
+            added++
+        }
+        store.keys = current
+        return added
+    }
+
+    /** Включён ли «авто-подключение при старте Android» */
+    var autoConnectOnBoot: Boolean
+        get() = context.prefs().getBoolean("auto_connect_on_boot", false)
+        set(v) { context.prefs().edit().putBoolean("auto_connect_on_boot", v).apply() }
+
     fun removeAt(index: Int) {
         val list = store.keys.toMutableList()
         if (index !in list.indices) return

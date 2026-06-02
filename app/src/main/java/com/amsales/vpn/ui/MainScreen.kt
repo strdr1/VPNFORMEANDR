@@ -37,6 +37,7 @@ import com.amsales.vpn.R
 import com.amsales.vpn.data.LocalRepository
 import com.amsales.vpn.data.Repository
 import com.amsales.vpn.ui.theme.*
+import com.amsales.vpn.vpn.rememberVpnState
 
 /**
  * Главный экран — 5 табов снизу (как в десктопе плюс «Серверы»):
@@ -53,7 +54,7 @@ fun MainScreen(
 
     CompositionLocalProvider(LocalRepository provides repository) {
         var tab by rememberSaveable { mutableIntStateOf(0) }
-        var connected by remember { mutableStateOf(false) }
+        val vpnState by rememberVpnState()
 
         Scaffold(
             containerColor = AmBgMid,
@@ -67,15 +68,10 @@ fun MainScreen(
             ) {
                 when (tab) {
                     0 -> VpnTab(
-                        connected = connected,
+                        state = vpnState,
                         onToggle = {
-                            if (connected) {
-                                onDisconnectRequest()
-                                connected = false
-                            } else {
-                                onConnectRequest()
-                                connected = true
-                            }
+                            if (vpnState.isOn || vpnState.isConnecting) onDisconnectRequest()
+                            else onConnectRequest()
                         }
                     )
                     1 -> ServersTab()
@@ -119,11 +115,13 @@ private fun BottomBar(active: Int, onSelect: (Int) -> Unit) {
 // ── VPN tab — главный экран с большой кнопкой ─────────────────────────
 
 @Composable
-private fun VpnTab(connected: Boolean, onToggle: () -> Unit) {
+private fun VpnTab(state: com.amsales.vpn.vpn.VpnUiState, onToggle: () -> Unit) {
     val repo = LocalRepository.current
     var currentIdx by remember { mutableIntStateOf(repo.currentIndex()) }
     val profiles = remember(currentIdx) { repo.profiles() }
     val activeName = profiles.getOrNull(currentIdx)?.name ?: "—"
+    val connected = state.isOn
+    val connecting = state.isConnecting
 
     Column(
         modifier = Modifier.fillMaxSize().padding(top = 32.dp),
@@ -161,31 +159,56 @@ private fun VpnTab(connected: Boolean, onToggle: () -> Unit) {
 
         Spacer(Modifier.height(36.dp))
 
-        PowerButton(connected = connected, onClick = onToggle)
+        PowerButton(connected = connected, connecting = connecting, onClick = onToggle)
 
         Spacer(Modifier.height(36.dp))
         Crossfade(
-            targetState = connected,
+            targetState = state.status,
             animationSpec = tween(600),
             label = "status"
-        ) { isOn ->
+        ) { st ->
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                val (label, color) = when (st) {
+                    "on"         -> stringResource(R.string.status_on) to AmAccent
+                    "connecting" -> stringResource(R.string.status_connecting) to AmTextHi
+                    "error"      -> "Ошибка" to androidx.compose.ui.graphics.Color(0xFFE8643C)
+                    else         -> stringResource(R.string.status_off) to AmTextHi
+                }
                 Text(
-                    text = stringResource(if (isOn) R.string.status_on else R.string.status_off),
-                    color = if (isOn) AmAccent else AmTextHi,
+                    text = label,
+                    color = color,
                     fontSize = 20.sp,
                     fontWeight = FontWeight.Medium
                 )
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    text = if (isOn) "· $activeName ·" else stringResource(R.string.tap_to_connect),
+                    text = when (st) {
+                        "on"         -> "· $activeName ·"
+                        "error"      -> state.error.ifEmpty { "Подключение не удалось" }
+                        else         -> stringResource(R.string.tap_to_connect)
+                    },
                     color = AmTextLo,
                     fontSize = 12.sp,
                     textAlign = TextAlign.Center
                 )
+                if (state.isOn && (state.rx > 0 || state.tx > 0)) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = "↓ ${formatBytes(state.rx)}   ↑ ${formatBytes(state.tx)}",
+                        color = AmTextLo,
+                        fontSize = 11.sp
+                    )
+                }
             }
         }
     }
+}
+
+private fun formatBytes(b: Long): String {
+    if (b < 1024) return "$b B"
+    if (b < 1024 * 1024) return "${b / 1024} KB"
+    if (b < 1024L * 1024 * 1024) return "%.1f MB".format(b / 1048576.0)
+    return "%.2f GB".format(b / 1073741824.0)
 }
 
 /**
@@ -313,23 +336,23 @@ private fun ProfileSelector(
  *  - press effect: scale 0.95
  */
 @Composable
-private fun PowerButton(connected: Boolean, onClick: () -> Unit) {
-    // Постоянная пульсация (только когда connected)
+private fun PowerButton(connected: Boolean, connecting: Boolean = false, onClick: () -> Unit) {
+    // Постоянная пульсация
     val transition = rememberInfiniteTransition(label = "pulse")
     val pulseAlpha by transition.animateFloat(
         initialValue = 0.15f,
-        targetValue = if (connected) 0.45f else 0.10f,
+        targetValue = if (connected || connecting) 0.45f else 0.10f,
         animationSpec = infiniteRepeatable(
-            animation = tween(1400, easing = LinearOutSlowInEasing),
+            animation = tween(if (connecting) 700 else 1400, easing = LinearOutSlowInEasing),
             repeatMode = RepeatMode.Reverse
         ),
         label = "alpha"
     )
     val pulseScale by transition.animateFloat(
         initialValue = 1.0f,
-        targetValue = if (connected) 1.04f else 1.0f,
+        targetValue = if (connected || connecting) 1.04f else 1.0f,
         animationSpec = infiniteRepeatable(
-            animation = tween(1400, easing = FastOutSlowInEasing),
+            animation = tween(if (connecting) 700 else 1400, easing = FastOutSlowInEasing),
             repeatMode = RepeatMode.Reverse
         ),
         label = "scale"

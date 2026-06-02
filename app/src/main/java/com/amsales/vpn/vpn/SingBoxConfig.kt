@@ -30,6 +30,8 @@ object SingBoxConfig {
             put("server_port", key.port)
             put("uuid", key.uuid)
             put("packet_encoding", "xudp")
+            // tcp_fast_open ускоряет установление коннекта на мобильных сетях
+            put("tcp_fast_open", true)
 
             // TLS + REALITY (если указано)
             if (key.security != "none" && key.security.isNotEmpty()) {
@@ -137,13 +139,25 @@ object SingBoxConfig {
             put("default_domain_resolver", JSONObject().put("server", "local"))
         }
 
+        // direct outbound: с TLS-фрагментацией если включён zapret-режим
+        val direct = JSONObject().apply {
+            put("type", "direct")
+            put("tag", "direct")
+            if (settings.useZapret) {
+                // TLS fragment — режет ClientHello на куски, DPI не успевает
+                // распознать SNI и не блокирует. Аналог GoodbyeDPI/zapret.
+                put("tls_fragment", true)
+                put("tls_fragment_fallback_delay", "500ms")
+            }
+        }
+
         val root = JSONObject().apply {
             put("log", JSONObject().put("level", "warn"))
             put("dns", dns)
             put("inbounds", JSONArray().put(tun))
             put("outbounds", JSONArray()
                 .put(vless)
-                .put(JSONObject().put("type", "direct").put("tag", "direct")))
+                .put(direct))
             put("route", route)
         }
 

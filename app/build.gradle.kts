@@ -82,4 +82,17 @@ dependencies {
 
     // JSON для парсинга sing-box-конфигов
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
+
+    // CameraX — для QR-сканера
+    val cameraxVersion = "1.3.4"
+    implementation("androidx.camera:camera-core:$cameraxVersion")
+    implementation("androidx.camera:camera-camera2:$cameraxVersion")
+    implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
+    implementation("androidx.camera:camera-view:$cameraxVersion")
+
+    // ML Kit barcode scanning (для QR)
+    implementation("com.google.mlkit:barcode-scanning:17.3.0")
+
+    // ZXing — для генерации QR
+    implementation("com.google.zxing:core:3.5.3")
 }

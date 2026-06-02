@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.net.TrafficStats
 import android.net.VpnService
 import android.os.Build
 import android.os.IBinder
@@ -20,6 +21,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.File
 import java.io.IOException
@@ -61,8 +64,11 @@ class AmSalesVpnService : VpnService() {
     private var tun: ParcelFileDescriptor? = null
     private var singBoxProcess: Process? = null
     private var singBoxJob: Job? = null
+    private var statsJob: Job? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var currentTag: String = ""
+    private var rxBaseline: Long = 0L
+    private var txBaseline: Long = 0L
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -95,9 +101,12 @@ class AmSalesVpnService : VpnService() {
         val repo = Repository(applicationContext)
         val key = repo.current()?.key ?: run {
             Log.e(TAG, "нет активного ключа — добавьте сервер на вкладке Серверы")
+            VpnState.broadcast(applicationContext, "error",
+                error = "Сначала добавьте ключ на вкладке Серверы")
             return
         }
         currentTag = key.tag
+        VpnState.broadcast(applicationContext, "connecting", tag = currentTag)
 
         // 1) Поднимаем TUN
         val builder = Builder()
@@ -120,6 +129,7 @@ class AmSalesVpnService : VpnService() {
         tun = builder.establish()
         if (tun == null) {
             Log.e(TAG, "TUN не поднялся")
+            VpnState.broadcast(applicationContext, "error", error = "Не удалось поднять TUN")
             return
         }
         Log.i(TAG, "TUN OK fd=${tun?.fd}, ключ=$currentTag, blacklist=${blacklist.size}")
@@ -130,20 +140,41 @@ class AmSalesVpnService : VpnService() {
         // 3) Foreground notification
         startForeground(NOTIF_ID, buildNotification(currentTag))
         isRunning = true
+
+        // 4) Базовое значение трафика для подсчёта дельты
+        rxBaseline = TrafficStats.getUidRxBytes(applicationInfo.uid).coerceAtLeast(0)
+        txBaseline = TrafficStats.getUidTxBytes(applicationInfo.uid).coerceAtLeast(0)
+        startStatsWatcher()
+
+        VpnState.broadcast(applicationContext, "on", tag = currentTag)
+    }
+
+    /** Раз в секунду шлёт broadcast с RX/TX (дельта от baseline). */
+    private fun startStatsWatcher() {
+        statsJob?.cancel()
+        statsJob = scope.launch {
+            while (isActive && isRunning) {
+                try {
+                    val rx = (TrafficStats.getUidRxBytes(applicationInfo.uid) - rxBaseline).coerceAtLeast(0)
+                    val tx = (TrafficStats.getUidTxBytes(applicationInfo.uid) - txBaseline).coerceAtLeast(0)
+                    VpnState.broadcast(applicationContext, "on", tag = currentTag, rx = rx, tx = tx)
+                } catch (_: Exception) {}
+                delay(1500)
+            }
+        }
     }
 
     private fun disconnect() {
         if (!isRunning && tun == null && singBoxProcess == null) return
         try {
-            singBoxJob?.cancel()
-            singBoxJob = null
-            singBoxProcess?.destroy()
-            singBoxProcess = null
-            tun?.close()
-            tun = null
+            statsJob?.cancel(); statsJob = null
+            singBoxJob?.cancel(); singBoxJob = null
+            singBoxProcess?.destroy(); singBoxProcess = null
+            tun?.close(); tun = null
             stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
             isRunning = false
+            VpnState.broadcast(applicationContext, "off")
+            stopSelf()
             Log.i(TAG, "disconnected")
         } catch (e: Exception) {
             Log.e(TAG, "ошибка при отключении", e)
