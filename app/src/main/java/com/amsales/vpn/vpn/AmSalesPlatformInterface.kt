@@ -122,7 +122,12 @@ class AmSalesPlatformInterface(
 
     override fun usePlatformAutoDetectInterfaceControl(): Boolean = true
 
-    override fun useProcFS(): Boolean = false
+    // ВАЖНО: useProcFS=true заставляет sing-box искать UID через /proc сам.
+    // Если оставить false — он зовёт findConnectionOwner на каждом TCP-пакете,
+    // и если мы вернём null или невалидный ConnectionOwner — Go-runtime
+    // делает result.UserId на nil pointer и весь sing-box падает SIGSEGV
+    // (service.go:218 в sing-box v1.13.12 — нет nil-check).
+    override fun useProcFS(): Boolean = true
 
     override fun includeAllNetworks(): Boolean = false
 
@@ -146,7 +151,12 @@ class AmSalesPlatformInterface(
         sourcePort: Int,
         destinationAddress: String?,
         destinationPort: Int
-    ): ConnectionOwner? = null
+    ): ConnectionOwner {
+        // НИКОГДА не возвращать null — Go-сторона sing-box v1.13.12
+        // не проверяет на nil и разыменовывает result.UserId → SIGSEGV.
+        // Бросаем Exception — Go получит err и продолжит без process-info.
+        throw Exception("not implemented")
+    }
 
     override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener?) {
         // No-op — sing-box справится со своим internal monitor
