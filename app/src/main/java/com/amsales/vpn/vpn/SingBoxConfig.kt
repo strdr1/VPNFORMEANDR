@@ -80,17 +80,32 @@ object SingBoxConfig {
             put("stack", "gvisor")
         }
 
-        // DNS
+        // DNS — два пути:
+        //  · remote: через прокси (TLS-CloudFlare DNS) — для VPN-трафика
+        //  · local:  через direct outbound к 8.8.8.8 (тот же сокет
+        //            protect()ит autoDetectInterfaceControl) — для имени
+        //            самого VLESS-сервера и .ru-доменов
         val dns = JSONObject().apply {
             put("servers", JSONArray()
                 .put(JSONObject()
                     .put("tag", "remote")
-                    .put("type", "https")
-                    .put("server", "1.1.1.1"))
+                    .put("type", "tls")
+                    .put("server", "1.1.1.1")
+                    .put("detour", "proxy"))
                 .put(JSONObject()
                     .put("tag", "local")
                     .put("type", "udp")
-                    .put("server", "77.88.8.8")))
+                    .put("server", "8.8.8.8")
+                    .put("detour", "direct")))
+            // Запросы за пределы VPN (.ru, bypass) — через local;
+            // всё остальное — через remote (внутри туннеля).
+            put("rules", JSONArray()
+                .put(JSONObject()
+                    .put("outbound", "direct")
+                    .put("server", "local"))
+                .put(JSONObject()
+                    .put("domain_suffix", ".ru")
+                    .put("server", "local")))
             put("strategy", "prefer_ipv4")
             put("final", "remote")
         }
@@ -126,7 +141,6 @@ object SingBoxConfig {
             put("rules", rules)
             put("final", "proxy")
             put("auto_detect_interface", true)
-            put("default_domain_resolver", JSONObject().put("server", "local"))
         }
 
         val direct = JSONObject().apply {
@@ -135,7 +149,12 @@ object SingBoxConfig {
         }
 
         val root = JSONObject().apply {
-            put("log", JSONObject().put("level", "warn"))
+            // info-уровень — увидим в логе попытки подключения к VLESS,
+            // DNS-разрешение, ошибки REALITY-handshake.
+            put("log", JSONObject()
+                .put("level", "debug")
+                .put("output", "stderr")
+                .put("timestamp", true))
             put("dns", dns)
             put("inbounds", JSONArray().put(tun))
             put("outbounds", JSONArray()

@@ -5,6 +5,7 @@ import android.util.Log
 import io.nekohasekai.libbox.ConnectionOwner
 import io.nekohasekai.libbox.InterfaceUpdateListener
 import io.nekohasekai.libbox.LocalDNSTransport
+import io.nekohasekai.libbox.NetworkInterface
 import io.nekohasekai.libbox.NetworkInterfaceIterator
 import io.nekohasekai.libbox.Notification
 import io.nekohasekai.libbox.PlatformInterface
@@ -143,7 +144,54 @@ class AmSalesPlatformInterface(
 
     override fun systemCertificates(): StringIterator? = null
 
-    override fun getInterfaces(): NetworkInterfaceIterator? = null
+    override fun getInterfaces(): NetworkInterfaceIterator {
+        // sing-box с auto_detect_interface=true зовёт getInterfaces чтобы
+        // найти upstream-интерфейс (НЕ TUN), через который выходить наружу.
+        // Если вернуть null — sing-box не сможет проксировать трафик никуда:
+        // VPN запустится, TUN поднимется, но в инет не пускает.
+        return AndroidNetworkInterfaceIterator()
+    }
+
+    /** Перечисляет JDK NetworkInterface и оборачивает в libbox.NetworkInterface. */
+    private class AndroidNetworkInterfaceIterator : NetworkInterfaceIterator {
+        private val iter: Iterator<java.net.NetworkInterface> = try {
+            java.net.NetworkInterface.getNetworkInterfaces()?.toList()
+                ?.filter { ni ->
+                    // Пропускаем выключенные и без адресов
+                    try { ni.isUp && !ni.inetAddresses.toList().isEmpty() }
+                    catch (_: Exception) { false }
+                }?.iterator()
+                ?: emptyList<java.net.NetworkInterface>().iterator()
+        } catch (_: Exception) {
+            emptyList<java.net.NetworkInterface>().iterator()
+        }
+
+        override fun hasNext(): Boolean = iter.hasNext()
+
+        override fun next(): NetworkInterface {
+            val ni = iter.next()
+            val out = NetworkInterface()
+            out.index = ni.index
+            out.mtu = try { ni.mtu } catch (_: Exception) { 1500 }
+            out.name = ni.name
+            val addrs = ni.inetAddresses.toList()
+                .mapNotNull { it.hostAddress }
+                .filter { it.isNotBlank() }
+            out.addresses = ListStringIterator(addrs)
+            out.flags = 0
+            out.type = 0
+            out.dnsServer = ListStringIterator(emptyList())
+            out.metered = false
+            return out
+        }
+    }
+
+    private class ListStringIterator(private val items: List<String>) : StringIterator {
+        private val iter = items.iterator()
+        override fun hasNext(): Boolean = iter.hasNext()
+        override fun len(): Int = items.size
+        override fun next(): String = iter.next()
+    }
 
     override fun findConnectionOwner(
         ipProtocol: Int,
