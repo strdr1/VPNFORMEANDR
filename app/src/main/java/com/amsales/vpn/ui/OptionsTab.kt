@@ -1,5 +1,8 @@
 package com.amsales.vpn.ui
 
+import android.content.Intent
+import android.net.Uri
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -8,6 +11,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.ContentPaste
+import androidx.compose.material.icons.outlined.OpenInNew
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -15,7 +20,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -39,6 +44,7 @@ import com.amsales.vpn.ui.theme.AmTextLo
 @Composable
 fun OptionsTab() {
     val repo = LocalRepository.current
+    val ctx = LocalContext.current
     val clipboard = LocalClipboardManager.current
     var routeRu by remember { mutableStateOf(repo.routeRuDirect) }
     var useZapret by remember { mutableStateOf(repo.useZapret) }
@@ -96,31 +102,89 @@ fun OptionsTab() {
             color = AmTextHi, fontSize = 14.sp, fontWeight = FontWeight.Medium
         )
         Text(
-            "MTProto через наш сервер",
+            "Ссылка вида tg://proxy?... или https://t.me/proxy?...",
             color = AmTextLo, fontSize = 11.sp
         )
         Spacer(Modifier.height(8.dp))
-        Surface(
-            color = AmBgTop,
-            shape = RoundedCornerShape(8.dp),
-            modifier = Modifier.fillMaxWidth()
+        OutlinedTextField(
+            value = tgLink,
+            onValueChange = {
+                tgLink = it
+                repo.tgProxyLink = it
+            },
+            placeholder = { Text("tg://proxy?server=...&port=...", color = AmTextLo) },
+            singleLine = false,
+            maxLines = 3,
+            modifier = Modifier.fillMaxWidth(),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedTextColor = AmTextHi,
+                unfocusedTextColor = AmTextHi,
+                focusedBorderColor = AmAccent,
+                unfocusedBorderColor = AmTextLo.copy(alpha = 0.3f),
+                cursorColor = AmAccent,
+                focusedContainerColor = AmBgTop,
+                unfocusedContainerColor = AmBgTop,
+            )
+        )
+        Spacer(Modifier.height(8.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Row(
-                Modifier.padding(12.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = tgLink,
-                    color = AmTextLo,
-                    fontSize = 11.sp,
-                    modifier = Modifier.weight(1f)
+            FilledTonalButton(
+                onClick = {
+                    if (tgLink.isBlank()) {
+                        Toast.makeText(ctx, "Сначала введите ссылку", Toast.LENGTH_SHORT).show()
+                    } else {
+                        openInTelegram(ctx, tgLink)
+                    }
+                },
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.filledTonalButtonColors(
+                    containerColor = AmAccent.copy(alpha = 0.18f),
+                    contentColor = AmAccent
                 )
-                TextButton(onClick = {
-                    clipboard.setText(AnnotatedString(tgLink))
-                }) {
-                    Text("Копировать", color = AmAccent, fontSize = 12.sp)
-                }
+            ) {
+                Icon(Icons.Outlined.OpenInNew, null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Открыть в TG", fontSize = 12.sp)
             }
+            FilledTonalButton(
+                onClick = {
+                    val pasted = clipboard.getText()?.text.orEmpty().trim()
+                    if (pasted.isEmpty()) {
+                        Toast.makeText(ctx, "Буфер пуст", Toast.LENGTH_SHORT).show()
+                    } else {
+                        tgLink = pasted
+                        repo.tgProxyLink = pasted
+                        Toast.makeText(ctx, "Вставлено", Toast.LENGTH_SHORT).show()
+                    }
+                },
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.filledTonalButtonColors(
+                    containerColor = AmAccent.copy(alpha = 0.18f),
+                    contentColor = AmAccent
+                )
+            ) {
+                Icon(Icons.Outlined.ContentPaste, null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Вставить", fontSize = 12.sp)
+            }
+            FilledTonalButton(
+                onClick = {
+                    if (tgLink.isBlank()) {
+                        Toast.makeText(ctx, "Нечего копировать", Toast.LENGTH_SHORT).show()
+                    } else {
+                        copyTextToSystemClipboard(ctx, "tg-proxy", tgLink)
+                        Toast.makeText(ctx, "Скопировано", Toast.LENGTH_SHORT).show()
+                    }
+                },
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.filledTonalButtonColors(
+                    containerColor = AmAccent.copy(alpha = 0.18f),
+                    contentColor = AmAccent
+                )
+            ) { Text("Копировать", fontSize = 12.sp) }
         }
         Divider()
 
@@ -243,4 +307,53 @@ private fun Divider() {
         thickness = 1.dp,
         color = AmTextLo.copy(alpha = 0.1f)
     )
+}
+
+/**
+ * Открывает TG-прокси в приложении Telegram. Принимает как tg://, так и
+ * https://t.me/proxy?... — пробуем строго в этом порядке, fallback на
+ * системный browser/chooser, если Telegram не установлен.
+ */
+private fun openInTelegram(ctx: android.content.Context, link: String) {
+    val cleaned = link.trim()
+    val uri = try { Uri.parse(cleaned) } catch (_: Exception) { null }
+    if (uri == null) {
+        Toast.makeText(ctx, "Невалидная ссылка", Toast.LENGTH_SHORT).show()
+        return
+    }
+    // Попытка №1 — прямой intent с Telegram-пакетом
+    val tgPackages = listOf("org.telegram.messenger", "org.telegram.plus", "nekox.messenger")
+    for (pkg in tgPackages) {
+        try {
+            val intent = Intent(Intent.ACTION_VIEW, uri)
+                .setPackage(pkg)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ctx.startActivity(intent)
+            return
+        } catch (_: Exception) {}
+    }
+    // Попытка №2 — открываем без явного пакета (любое приложение/браузер)
+    try {
+        val intent = Intent(Intent.ACTION_VIEW, uri)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        ctx.startActivity(Intent.createChooser(intent, "Открыть прокси")
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    } catch (e: Exception) {
+        Toast.makeText(ctx, "Не могу открыть: ${e.message}", Toast.LENGTH_LONG).show()
+    }
+}
+
+/**
+ * Копирует в системный буфер через ClipboardManager.
+ * Compose-овский LocalClipboardManager на ряде прошивок MIUI глючит
+ * (молча проглатывает setText), поэтому используем платформенный API.
+ */
+private fun copyTextToSystemClipboard(ctx: android.content.Context, label: String, text: String) {
+    try {
+        val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+            as android.content.ClipboardManager
+        cm.setPrimaryClip(android.content.ClipData.newPlainText(label, text))
+    } catch (e: Exception) {
+        Toast.makeText(ctx, "Не удалось скопировать: ${e.message}", Toast.LENGTH_LONG).show()
+    }
 }
