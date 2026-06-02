@@ -80,11 +80,21 @@ object SingBoxConfig {
             put("stack", "gvisor")
         }
 
-        // DNS — два пути:
-        //  · remote: через прокси (TLS-CloudFlare DNS) — для VPN-трафика
-        //  · local:  через direct outbound к 8.8.8.8 (тот же сокет
-        //            protect()ит autoDetectInterfaceControl) — для имени
-        //            самого VLESS-сервера и .ru-доменов
+        // DNS — два сервера:
+        //  · remote: TLS DoH 1.1.1.1, идёт ЧЕРЕЗ прокси (detour=proxy)
+        //  · local:  UDP 8.8.8.8, без detour — sing-box возьмёт default route
+        //            (защищённый VpnService.protect() через
+        //            autoDetectInterfaceControl), т.е. реально пойдёт через
+        //            wlan0/rmnet, а не обратно в TUN.
+        //
+        // Правила:
+        //   · .ru-домены → local (вне VPN)
+        //   · всё остальное → remote (через VPN)
+        //
+        // НЕ используем "outbound: direct → server: local" — это ловушка
+        // в 1.13.12: direct outbound без override-полей считается "empty",
+        // и detour на него запрещён, а в DNS-правилах outbound-условие
+        // вызывает аналогичную проверку.
         val dns = JSONObject().apply {
             put("servers", JSONArray()
                 .put(JSONObject()
@@ -95,17 +105,22 @@ object SingBoxConfig {
                 .put(JSONObject()
                     .put("tag", "local")
                     .put("type", "udp")
-                    .put("server", "8.8.8.8")
-                    .put("detour", "direct")))
-            // Запросы за пределы VPN (.ru, bypass) — через local;
-            // всё остальное — через remote (внутри туннеля).
-            put("rules", JSONArray()
-                .put(JSONObject()
-                    .put("outbound", "direct")
-                    .put("server", "local"))
-                .put(JSONObject()
+                    .put("server", "8.8.8.8")))
+            val dnsRules = JSONArray()
+            if (settings.routeRuDirect) {
+                dnsRules.put(JSONObject()
                     .put("domain_suffix", ".ru")
-                    .put("server", "local")))
+                    .put("server", "local"))
+            }
+            val bypassForDns = settings.bypassSites
+            if (bypassForDns.isNotEmpty()) {
+                val dom = JSONArray()
+                bypassForDns.forEach { dom.put(it) }
+                dnsRules.put(JSONObject()
+                    .put("domain_suffix", dom)
+                    .put("server", "local"))
+            }
+            if (dnsRules.length() > 0) put("rules", dnsRules)
             put("strategy", "prefer_ipv4")
             put("final", "remote")
         }

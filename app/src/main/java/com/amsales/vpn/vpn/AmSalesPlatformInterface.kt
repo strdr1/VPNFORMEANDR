@@ -1,5 +1,12 @@
 package com.amsales.vpn.vpn
 
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
+import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import io.nekohasekai.libbox.ConnectionOwner
@@ -12,16 +19,23 @@ import io.nekohasekai.libbox.PlatformInterface
 import io.nekohasekai.libbox.StringIterator
 import io.nekohasekai.libbox.TunOptions
 import io.nekohasekai.libbox.WIFIState
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Реализация libbox.PlatformInterface — мост между Java/Kotlin и Go-кодом
- * sing-box. Самый важный метод — openTun(options): здесь мы поднимаем
+ * sing-box.
+ *
+ * Самый важный метод — openTun(options): здесь мы поднимаем
  * VpnService.Builder с параметрами от sing-box, делаем establish() и
  * возвращаем целочисленный fd, который Go-сторона использует как TUN.
  *
- * Минимально-достаточная реализация для VLESS+REALITY. Многие методы
- * возвращают пустые значения / null — sing-box тогда использует свой
- * собственный механизм (например, sniff network interfaces изнутри Go).
+ * Также критично:
+ *   - getInterfaces(): возвращает реальные сетевые интерфейсы Android
+ *     (БЕЗ нашего TUN — иначе sing-box зациклится на нём как на upstream).
+ *   - startDefaultInterfaceMonitor: подписывается на ConnectivityManager
+ *     и сообщает sing-box какой интерфейс является default, чтобы
+ *     auto_detect_interface работал. Без этого direct-outbound и TLS-DNS
+ *     с detour=proxy не имеют upstream — трафик не идёт.
  */
 class AmSalesPlatformInterface(
     private val service: AmSalesVpnService,
@@ -30,6 +44,18 @@ class AmSalesPlatformInterface(
 
     @Volatile var tunFd: ParcelFileDescriptor? = null
         private set
+    @Volatile private var tunName: String = "tun0"
+
+    private val cm: ConnectivityManager? =
+        service.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+
+    private val callbackRef = AtomicReference<ConnectivityManager.NetworkCallback?>(null)
+    private val currentDefault = AtomicReference<DefaultInterface?>(null)
+
+    private data class DefaultInterface(
+        val name: String, val index: Int,
+        val isExpensive: Boolean, val isConstrained: Boolean,
+    )
 
     override fun openTun(options: TunOptions): Int {
         Log.i(TAG, "openTun: MTU=${options.mtu}, autoRoute=${options.autoRoute}")
@@ -45,7 +71,6 @@ class AmSalesPlatformInterface(
             try { builder.addAddress(p.address(), p.prefix()) }
             catch (e: Exception) { Log.w(TAG, "addAddress v4 failed: ${e.message}") }
         }
-        // IPv6 addresses (если есть)
         val v6iter = options.inet6Address
         while (v6iter != null && v6iter.hasNext()) {
             val p = v6iter.next() ?: continue
@@ -53,8 +78,7 @@ class AmSalesPlatformInterface(
             catch (_: Exception) {}
         }
 
-        // Routes: если включён autoRoute — sing-box сам передаст 0.0.0.0/0
-        // через RouteAddress; иначе используем дефолт.
+        // Routes: если sing-box передал — используем; иначе дефолт 0.0.0.0/0
         var routesAdded = false
         val r4 = options.inet4RouteAddress
         while (r4 != null && r4.hasNext()) {
@@ -72,28 +96,29 @@ class AmSalesPlatformInterface(
             builder.addRoute("0.0.0.0", 0)
         }
 
-        // DNS
+        // DNS — используем фиксированный (системный потом перехватим
+        // через hijack-dns правило в sing-box)
         try {
             val dns = options.dnsServerAddress
             if (dns != null && dns.value.isNotBlank()) {
                 builder.addDnsServer(dns.value)
             } else {
                 builder.addDnsServer("1.1.1.1")
-                builder.addDnsServer("77.88.8.8")
+                builder.addDnsServer("8.8.8.8")
             }
         } catch (_: Exception) {
             builder.addDnsServer("1.1.1.1")
         }
 
-        // Split tunneling — приложения мимо VPN (наш blacklist)
+        // Split tunneling
         for (pkg in blacklistApps) {
             try { builder.addDisallowedApplication(pkg) }
             catch (e: Exception) { Log.w(TAG, "skip $pkg: ${e.message}") }
         }
-        // Сам себя — мимо туннеля (иначе зацикливается)
+        // ОБЯЗАТЕЛЬНО: сам себя — мимо туннеля. Без этого sing-box internal
+        // сокеты замыкаются.
         try { builder.addDisallowedApplication(service.packageName) } catch (_: Exception) {}
 
-        // sing-box может передать включаемые/исключаемые приложения
         val excl: StringIterator? = options.excludePackage
         while (excl != null && excl.hasNext()) {
             val pkg = excl.next() ?: continue
@@ -108,14 +133,38 @@ class AmSalesPlatformInterface(
         val pfd = builder.establish()
             ?: throw RuntimeException("VpnService.Builder.establish() вернул null — нет разрешения?")
         tunFd = pfd
-        Log.i(TAG, "TUN установлен, fd=${pfd.fd}")
+
+        // Запомнили имя TUN-интерфейса чтобы исключить из getInterfaces.
+        tunName = guessTunName(pfd.fd)
+
+        Log.i(TAG, "TUN установлен, fd=${pfd.fd}, имя~$tunName")
         return pfd.fd
     }
 
+    private fun guessTunName(fd: Int): String {
+        // На Android VpnService туннели обычно называются tun0, tun1...
+        // Точно определить нельзя без ioctl. Берём все имена которые
+        // НЕ выглядят как обычные сетевые интерфейсы.
+        return try {
+            val all = java.net.NetworkInterface.getNetworkInterfaces().toList()
+            // Ищем интерфейс с адресом 172.19.0.1 (наш TUN_ADDRESS)
+            for (ni in all) {
+                for (addr in ni.inetAddresses.toList()) {
+                    if (addr.hostAddress == AmSalesVpnService.TUN_ADDRESS) {
+                        return ni.name
+                    }
+                }
+            }
+            "tun0"
+        } catch (_: Exception) { "tun0" }
+    }
+
     override fun autoDetectInterfaceControl(fd: Int) {
-        // Защита сокета от попадания обратно в TUN.
+        // Защита сокета — без этого исходящий коннект к VLESS-серверу
+        // зайдёт обратно в наш TUN и зациклится.
         try {
-            service.protect(fd)
+            val ok = service.protect(fd)
+            if (!ok) Log.w(TAG, "service.protect($fd) returned false")
         } catch (e: Exception) {
             Log.w(TAG, "protect($fd) failed: ${e.message}")
         }
@@ -123,20 +172,13 @@ class AmSalesPlatformInterface(
 
     override fun usePlatformAutoDetectInterfaceControl(): Boolean = true
 
-    // ВАЖНО: useProcFS=true заставляет sing-box искать UID через /proc сам.
-    // Если оставить false — он зовёт findConnectionOwner на каждом TCP-пакете,
-    // и если мы вернём null или невалидный ConnectionOwner — Go-runtime
-    // делает result.UserId на nil pointer и весь sing-box падает SIGSEGV
-    // (service.go:218 в sing-box v1.13.12 — нет nil-check).
     override fun useProcFS(): Boolean = true
 
     override fun includeAllNetworks(): Boolean = false
 
     override fun underNetworkExtension(): Boolean = false
 
-    override fun clearDNSCache() {
-        // No-op — Android сам управляет DNS-кэшем
-    }
+    override fun clearDNSCache() { /* no-op */ }
 
     override fun readWIFIState(): WIFIState? = null
 
@@ -145,21 +187,21 @@ class AmSalesPlatformInterface(
     override fun systemCertificates(): StringIterator? = null
 
     override fun getInterfaces(): NetworkInterfaceIterator {
-        // sing-box с auto_detect_interface=true зовёт getInterfaces чтобы
-        // найти upstream-интерфейс (НЕ TUN), через который выходить наружу.
-        // Если вернуть null — sing-box не сможет проксировать трафик никуда:
-        // VPN запустится, TUN поднимется, но в инет не пускает.
-        return AndroidNetworkInterfaceIterator()
+        return AndroidNetworkInterfaceIterator(tunName)
     }
 
-    /** Перечисляет JDK NetworkInterface и оборачивает в libbox.NetworkInterface. */
-    private class AndroidNetworkInterfaceIterator : NetworkInterfaceIterator {
+    /** Перечисляет JDK NetworkInterface исключая наш TUN. */
+    private class AndroidNetworkInterfaceIterator(private val excludeTun: String) : NetworkInterfaceIterator {
         private val iter: Iterator<java.net.NetworkInterface> = try {
             java.net.NetworkInterface.getNetworkInterfaces()?.toList()
                 ?.filter { ni ->
-                    // Пропускаем выключенные и без адресов
-                    try { ni.isUp && !ni.inetAddresses.toList().isEmpty() }
-                    catch (_: Exception) { false }
+                    try {
+                        ni.isUp
+                            && ni.inetAddresses.toList().isNotEmpty()
+                            && ni.name != excludeTun
+                            && !ni.name.startsWith("tun")  // на всякий случай — все tun-ы
+                            && !ni.isLoopback
+                    } catch (_: Exception) { false }
                 }?.iterator()
                 ?: emptyList<java.net.NetworkInterface>().iterator()
         } catch (_: Exception) {
@@ -200,18 +242,75 @@ class AmSalesPlatformInterface(
         destinationAddress: String?,
         destinationPort: Int
     ): ConnectionOwner {
-        // НИКОГДА не возвращать null — Go-сторона sing-box v1.13.12
-        // не проверяет на nil и разыменовывает result.UserId → SIGSEGV.
-        // Бросаем Exception — Go получит err и продолжит без process-info.
+        // Бросаем Exception — иначе SIGSEGV в Go (см. ранний баг-репорт).
         throw Exception("not implemented")
     }
 
     override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener?) {
-        // No-op — sing-box справится со своим internal monitor
+        listener ?: return
+        val mgr = cm ?: return
+
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                updateFromNetwork(network, listener)
+            }
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                updateFromNetwork(network, listener, caps)
+            }
+            override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
+                updateFromNetwork(network, listener, lp = lp)
+            }
+            override fun onLost(network: Network) {
+                Log.i(TAG, "default network lost")
+            }
+        }
+        try {
+            mgr.registerDefaultNetworkCallback(cb)
+            callbackRef.set(cb)
+            Log.i(TAG, "default-interface monitor started")
+        } catch (e: Exception) {
+            Log.w(TAG, "registerDefaultNetworkCallback failed: ${e.message}")
+        }
+    }
+
+    private fun updateFromNetwork(
+        network: Network,
+        listener: InterfaceUpdateListener,
+        caps: NetworkCapabilities? = null,
+        lp: LinkProperties? = null,
+    ) {
+        try {
+            val name = (lp ?: cm?.getLinkProperties(network))?.interfaceName
+                ?: return
+            val ji = try { java.net.NetworkInterface.getByName(name) } catch (_: Exception) { null }
+            val index = ji?.index ?: 0
+            val capsR = caps ?: cm?.getNetworkCapabilities(network)
+            val isExpensive = capsR?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == false
+            val isConstrained = false
+
+            val di = DefaultInterface(name, index, isExpensive, isConstrained)
+            val prev = currentDefault.getAndSet(di)
+            if (prev != di) {
+                Log.i(TAG, "default interface: $name (index=$index, metered=$isExpensive)")
+                try {
+                    listener.updateDefaultInterface(name, index, isExpensive, isConstrained)
+                } catch (e: Exception) {
+                    Log.w(TAG, "updateDefaultInterface failed: ${e.message}")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "updateFromNetwork failed: ${e.message}")
+        }
     }
 
     override fun closeDefaultInterfaceMonitor(listener: InterfaceUpdateListener?) {
-        // No-op
+        val cb = callbackRef.getAndSet(null) ?: return
+        try { cm?.unregisterNetworkCallback(cb) } catch (_: Exception) {}
+        Log.i(TAG, "default-interface monitor stopped")
     }
 
     override fun sendNotification(notification: Notification?) {
