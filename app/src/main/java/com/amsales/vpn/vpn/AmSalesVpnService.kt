@@ -18,6 +18,7 @@ import com.amsales.vpn.ui.MainActivity
 import io.nekohasekai.libbox.CommandServer
 import io.nekohasekai.libbox.CommandServerHandler
 import io.nekohasekai.libbox.Libbox
+import io.nekohasekai.libbox.OverrideOptions
 import io.nekohasekai.libbox.SetupOptions
 import io.nekohasekai.libbox.SystemProxyStatus
 import kotlinx.coroutines.CoroutineScope
@@ -177,7 +178,14 @@ class AmSalesVpnService : VpnService() {
             }
 
             stage("startOrReloadService") {
-                server.startOrReloadService(json, null)
+                // ВАЖНО: nil тут падает в Go-коде sing-box 1.13.12
+                // (s.StartedService.StartOrReloadService(.., &daemon.OverrideOptions{
+                //   AutoRedirect: options.AutoRedirect, ...}) — без nil-check).
+                // Передаём пустой OverrideOptions с дефолтами.
+                val overrides = OverrideOptions().apply {
+                    autoRedirect = false
+                }
+                server.startOrReloadService(json, overrides)
             }
 
             // 5. foreground notification + статистика
