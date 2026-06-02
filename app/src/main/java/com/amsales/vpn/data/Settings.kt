@@ -38,14 +38,11 @@ class Settings(context: Context) {
         }
 
     /**
-     * При первом запуске вшиваем дефолтные ключи AM.SALES. Если у пользователя
-     * уже что-то в Store — не трогаем.
+     * Раньше вшивали дефолтные ключи AM.SALES. Сейчас оставляем пустой
+     * Store — пользователь сам добавит свои через вкладку «Серверы».
      */
     fun ensureDefaults() {
-        if (keys.isEmpty()) {
-            keys = VlessKeys.defaults
-            currentKeyIndex = 0
-        }
+        // ничего не делаем
     }
 
     companion object {

@@ -72,8 +72,7 @@ class Repository(private val context: Context) {
         set(v) { context.prefs().edit().putBoolean("use_zapret", v).apply() }
 
     var tgProxyLink: String
-        get() = context.prefs().getString("tg_proxy_link",
-            "tg://proxy?server=78.17.103.241&port=8443&secret=7pwrj8t67zLQ4Q3gAljWB4tnb29nbGUuY29t") ?: ""
+        get() = context.prefs().getString("tg_proxy_link", "") ?: ""
         set(v) { context.prefs().edit().putString("tg_proxy_link", v).apply() }
 
     var bypassSites: List<String>

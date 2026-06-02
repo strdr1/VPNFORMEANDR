@@ -31,5 +31,5 @@
     <!-- О программе -->
     <string name="about_title">AM.SALES VPN для Android</string>
     <string name="about_version">Версия %1$s</string>
-    <string name="about_desc">VLESS+REALITY через sing-box. Сервер: 78.17.103.241 + Cloudflare Worker для DPI-обхода.</string>
+    <string name="about_desc">VLESS+REALITY клиент на базе sing-box.</string>
 </resources>

@@ -179,40 +179,6 @@ fun OptionsTab() {
         }
         Divider()
 
-        // Cloudflare-ключ — на Android это просто инфо-секция:
-        // в десктопе была кнопка «Обновить» т.к. URL trycloudflare.com
-        // менялся. Сейчас мы перешли на Worker — URL вечный,
-        // обновлять нечего. Оставлю как инфо.
-        Spacer(Modifier.height(16.dp))
-        Text(
-            "Cloudflare-ключ",
-            color = AmTextHi, fontSize = 14.sp, fontWeight = FontWeight.Medium
-        )
-        Text(
-            "Используется Cloudflare Worker — постоянный URL, обновление не требуется.",
-            color = AmTextLo, fontSize = 11.sp
-        )
-        Spacer(Modifier.height(8.dp))
-        Surface(
-            color = AmBgTop, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()
-        ) {
-            Row(
-                Modifier.padding(12.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    "amsales-vpn.danecc5678.workers.dev",
-                    color = AmTextLo, fontSize = 11.sp, modifier = Modifier.weight(1f)
-                )
-                TextButton(onClick = {
-                    clipboard.setText(AnnotatedString("amsales-vpn.danecc5678.workers.dev"))
-                }) {
-                    Text("Копировать", color = AmAccent, fontSize = 12.sp)
-                }
-            }
-        }
-        Divider()
-
         // Обновления
         Spacer(Modifier.height(16.dp))
         Text(
