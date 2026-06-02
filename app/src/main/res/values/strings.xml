@@ -10,6 +10,7 @@
 
     <!-- Табы -->
     <string name="tab_vpn">VPN</string>
+    <string name="tab_servers">Серверы</string>
     <string name="tab_apps">Приложения</string>
     <string name="tab_options">Опции</string>
     <string name="tab_about">О программе</string>
