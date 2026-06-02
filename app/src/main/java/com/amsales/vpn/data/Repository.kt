@@ -99,6 +99,24 @@ class Repository(private val context: Context) {
             ?.split(",")?.filter { it.isNotBlank() } ?: emptyList()
         set(v) { context.prefs().edit().putString("bypass_sites", v.joinToString(",")).apply() }
 
+    // ── TG-прокси (локальный MTProto WS-bridge) ─────────────────────────
+
+    /** 32-символьный hex-секрет MTProto. Генерится при первом запуске движка. */
+    var tgSecret: String
+        get() = context.prefs().getString("tg_secret", "") ?: ""
+        set(v) { context.prefs().edit().putString("tg_secret", v).apply() }
+
+    /** Cloudflare Worker для туннелирования (опционально). */
+    var tgWorkerDomain: String
+        get() = context.prefs().getString("tg_worker_domain",
+            "shiny-hill-d2ef.danecc5678.workers.dev") ?: ""
+        set(v) { context.prefs().edit().putString("tg_worker_domain", v).apply() }
+
+    /** Fake TLS маскировочный домен (опционально). */
+    var tgFakeTlsDomain: String
+        get() = context.prefs().getString("tg_fake_tls", "") ?: ""
+        set(v) { context.prefs().edit().putString("tg_fake_tls", v).apply() }
+
     // ── Split tunneling ────────────────────────────────────────────────
 
     var blacklistApps: Set<String>

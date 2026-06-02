@@ -63,6 +63,16 @@
                 android:value="VPN tunneling service for AM.SALES VPN" />
         </service>
 
+        <!-- TG-прокси: локальный MTProto WS-bridge на 127.0.0.1:1443 -->
+        <service
+            android:name=".tgproxy.TgProxyService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Local MTProto proxy bridge for Telegram" />
+        </service>
+
         <!-- Авто-подключение при загрузке Android (опционально) -->
         <receiver
             android:name=".vpn.BootReceiver"

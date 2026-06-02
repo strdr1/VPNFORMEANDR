@@ -2,6 +2,7 @@ package com.amsales.vpn.ui
 
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -11,15 +12,17 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Close
-import androidx.compose.material.icons.outlined.ContentPaste
 import androidx.compose.material.icons.outlined.OpenInNew
+import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Stop
+import com.amsales.vpn.tgproxy.TgProxyService
+import com.amsales.vpn.tgproxy.rememberTgProxyState
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -45,13 +48,17 @@ import com.amsales.vpn.ui.theme.AmTextLo
 fun OptionsTab() {
     val repo = LocalRepository.current
     val ctx = LocalContext.current
-    val clipboard = LocalClipboardManager.current
     var routeRu by remember { mutableStateOf(repo.routeRuDirect) }
     var useZapret by remember { mutableStateOf(repo.useZapret) }
     var autoBoot by remember { mutableStateOf(repo.autoConnectOnBoot) }
-    var tgLink by remember { mutableStateOf(repo.tgProxyLink) }
     var bypassSites by remember { mutableStateOf(repo.bypassSites) }
     var newSite by remember { mutableStateOf("") }
+    val tgState by rememberTgProxyState()
+    var tgLink by remember { mutableStateOf(repo.tgProxyLink) }
+    // если сервис прислал свежую ссылку — обновим локальный
+    if (tgState.link.isNotEmpty() && tgState.link != tgLink) {
+        tgLink = tgState.link
+    }
 
     Column(
         Modifier
@@ -95,96 +102,99 @@ fun OptionsTab() {
         }
         Divider()
 
-        // Telegram-прокси
+        // Telegram-прокси — локальный MTProto WS-bridge движок
         Spacer(Modifier.height(12.dp))
         Text(
             "Telegram-прокси",
             color = AmTextHi, fontSize = 14.sp, fontWeight = FontWeight.Medium
         )
         Text(
-            "Ссылка вида tg://proxy?... или https://t.me/proxy?...",
+            "Поднимает локальный MTProto-прокси на 127.0.0.1:1443 — гонит " +
+                "Telegram через Cloudflare. Аналог TG-движка из десктопа.",
             color = AmTextLo, fontSize = 11.sp
         )
         Spacer(Modifier.height(8.dp))
-        OutlinedTextField(
-            value = tgLink,
-            onValueChange = {
-                tgLink = it
-                repo.tgProxyLink = it
+
+        // Главная кнопка — Включить / Выключить
+        Button(
+            onClick = {
+                val intent = Intent(ctx, TgProxyService::class.java)
+                    .setAction(
+                        if (tgState.running) TgProxyService.ACTION_STOP
+                        else TgProxyService.ACTION_START
+                    )
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    ctx.startForegroundService(intent)
+                } else {
+                    ctx.startService(intent)
+                }
             },
-            placeholder = { Text("tg://proxy?server=...&port=...", color = AmTextLo) },
-            singleLine = false,
-            maxLines = 3,
             modifier = Modifier.fillMaxWidth(),
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedTextColor = AmTextHi,
-                unfocusedTextColor = AmTextHi,
-                focusedBorderColor = AmAccent,
-                unfocusedBorderColor = AmTextLo.copy(alpha = 0.3f),
-                cursorColor = AmAccent,
-                focusedContainerColor = AmBgTop,
-                unfocusedContainerColor = AmBgTop,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (tgState.running) AmTextLo.copy(alpha = 0.3f) else AmAccent,
+                contentColor = if (tgState.running) AmTextHi else AmBgTop
             )
-        )
-        Spacer(Modifier.height(8.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            FilledTonalButton(
-                onClick = {
-                    if (tgLink.isBlank()) {
-                        Toast.makeText(ctx, "Сначала введите ссылку", Toast.LENGTH_SHORT).show()
-                    } else {
-                        openInTelegram(ctx, tgLink)
-                    }
-                },
-                modifier = Modifier.weight(1f),
-                colors = ButtonDefaults.filledTonalButtonColors(
-                    containerColor = AmAccent.copy(alpha = 0.18f),
-                    contentColor = AmAccent
-                )
+            Icon(
+                if (tgState.running) Icons.Outlined.Stop else Icons.Outlined.PlayArrow,
+                null,
+                modifier = Modifier.size(18.dp)
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                if (tgState.running) "Выключить TG-прокси" else "Включить TG-прокси",
+                fontWeight = FontWeight.Medium
+            )
+        }
+
+        if (tgState.error.isNotEmpty()) {
+            Spacer(Modifier.height(6.dp))
+            Text("Ошибка: ${tgState.error}",
+                color = androidx.compose.ui.graphics.Color(0xFFFF7373), fontSize = 11.sp)
+        }
+
+        if (tgState.running && tgLink.isNotEmpty()) {
+            Spacer(Modifier.height(10.dp))
+            Surface(
+                color = AmBgTop, shape = RoundedCornerShape(8.dp),
+                modifier = Modifier.fillMaxWidth()
             ) {
-                Icon(Icons.Outlined.OpenInNew, null, modifier = Modifier.size(16.dp))
-                Spacer(Modifier.width(6.dp))
-                Text("Открыть в TG", fontSize = 12.sp)
+                Column(Modifier.padding(12.dp)) {
+                    Text("Ссылка для Telegram:",
+                        color = AmTextLo, fontSize = 11.sp)
+                    Spacer(Modifier.height(4.dp))
+                    Text(tgLink, color = AmTextHi, fontSize = 11.sp)
+                }
             }
-            FilledTonalButton(
-                onClick = {
-                    val pasted = clipboard.getText()?.text.orEmpty().trim()
-                    if (pasted.isEmpty()) {
-                        Toast.makeText(ctx, "Буфер пуст", Toast.LENGTH_SHORT).show()
-                    } else {
-                        tgLink = pasted
-                        repo.tgProxyLink = pasted
-                        Toast.makeText(ctx, "Вставлено", Toast.LENGTH_SHORT).show()
-                    }
-                },
-                modifier = Modifier.weight(1f),
-                colors = ButtonDefaults.filledTonalButtonColors(
-                    containerColor = AmAccent.copy(alpha = 0.18f),
-                    contentColor = AmAccent
-                )
+            Spacer(Modifier.height(8.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Icon(Icons.Outlined.ContentPaste, null, modifier = Modifier.size(16.dp))
-                Spacer(Modifier.width(6.dp))
-                Text("Вставить", fontSize = 12.sp)
-            }
-            FilledTonalButton(
-                onClick = {
-                    if (tgLink.isBlank()) {
-                        Toast.makeText(ctx, "Нечего копировать", Toast.LENGTH_SHORT).show()
-                    } else {
+                FilledTonalButton(
+                    onClick = { openInTelegram(ctx, tgLink) },
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.filledTonalButtonColors(
+                        containerColor = AmAccent.copy(alpha = 0.18f),
+                        contentColor = AmAccent
+                    )
+                ) {
+                    Icon(Icons.Outlined.OpenInNew, null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Открыть в TG", fontSize = 12.sp)
+                }
+                FilledTonalButton(
+                    onClick = {
                         copyTextToSystemClipboard(ctx, "tg-proxy", tgLink)
                         Toast.makeText(ctx, "Скопировано", Toast.LENGTH_SHORT).show()
-                    }
-                },
-                modifier = Modifier.weight(1f),
-                colors = ButtonDefaults.filledTonalButtonColors(
-                    containerColor = AmAccent.copy(alpha = 0.18f),
-                    contentColor = AmAccent
-                )
-            ) { Text("Копировать", fontSize = 12.sp) }
+                    },
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.filledTonalButtonColors(
+                        containerColor = AmAccent.copy(alpha = 0.18f),
+                        contentColor = AmAccent
+                    )
+                ) { Text("Копировать", fontSize = 12.sp) }
+            }
         }
         Divider()
 
