@@ -95,6 +95,21 @@ class AmSalesVpnService : VpnService() {
     private suspend fun connect() {
         if (isRunning || !starting.compareAndSet(false, true)) return
 
+        val crashLog = File(applicationContext.filesDir, "crash.log")
+        fun stage(name: String, block: () -> Unit) {
+            try {
+                Log.i(TAG, ">>> $name")
+                block()
+                Log.i(TAG, "<<< $name OK")
+            } catch (t: Throwable) {
+                val msg = "FAIL at [$name]: ${t.javaClass.simpleName}: ${t.message}"
+                Log.e(TAG, msg, t)
+                crashLog.appendText("\n[${System.currentTimeMillis()}] $msg\n" +
+                    t.stackTraceToString() + "\n")
+                throw t
+            }
+        }
+
         try {
             val repo = Repository(applicationContext)
             val key = repo.current()?.key ?: run {
@@ -106,17 +121,26 @@ class AmSalesVpnService : VpnService() {
             currentTag = key.tag
             VpnState.broadcast(applicationContext, "connecting", tag = currentTag)
 
-            // 1. setup путей
+            // 1. перенаправляем Go-stderr в файл (для Go-паник)
             val baseDir = File(applicationContext.filesDir, "sing-box").apply { mkdirs() }
             val workDir = File(baseDir, "work").apply { mkdirs() }
             val tmpDir = File(applicationContext.cacheDir, "sing-box").apply { mkdirs() }
-            val setup = SetupOptions().apply {
-                basePath = baseDir.absolutePath
-                workingPath = workDir.absolutePath
-                tempPath = tmpDir.absolutePath
+            val stderrPath = File(applicationContext.filesDir, "stderr.log").absolutePath
+
+            stage("redirectStderr") {
+                try { Libbox.redirectStderr(stderrPath) }
+                catch (e: Throwable) { Log.w(TAG, "redirectStderr fail: ${e.message}") }
             }
-            Libbox.setup(setup)
-            Log.i(TAG, "Libbox.setup OK, version=${Libbox.version()}")
+
+            stage("Libbox.setup") {
+                val setup = SetupOptions().apply {
+                    basePath = baseDir.absolutePath
+                    workingPath = workDir.absolutePath
+                    tempPath = tmpDir.absolutePath
+                }
+                Libbox.setup(setup)
+                Log.i(TAG, "version=${Libbox.version()}")
+            }
 
             // 2. PlatformInterface — мост из Go в наш VpnService
             val platform = AmSalesPlatformInterface(this, repo.blacklistApps.toSet())
@@ -135,28 +159,26 @@ class AmSalesVpnService : VpnService() {
                     if (!message.isNullOrEmpty()) Log.d("sing-box", message)
                 }
             }
-            val server = Libbox.newCommandServer(handler, platform)
-            server.start()
+            lateinit var server: CommandServer
+            stage("newCommandServer") {
+                server = Libbox.newCommandServer(handler, platform)
+            }
+            stage("CommandServer.start") {
+                server.start()
+            }
             commandServer = server
-            Log.i(TAG, "CommandServer started")
 
-            // 4. собираем JSON-конфиг и запускаем сервис
+            // 4. собираем JSON-конфиг
             val json = SingBoxConfig.build(key, repo, TUN_MTU)
-            Log.d(TAG, "sing-box config: ${json.take(500)}…")
+            Log.d(TAG, "sing-box config:\n$json")
 
-            try {
+            stage("Libbox.checkConfig") {
                 Libbox.checkConfig(json)
-            } catch (e: Exception) {
-                Log.e(TAG, "checkConfig failed: ${e.message}")
-                VpnState.broadcast(applicationContext, "error",
-                    error = "Невалидный конфиг: ${e.message}")
-                cleanup()
-                stopSelf()
-                return
             }
 
-            server.startOrReloadService(json, null)
-            Log.i(TAG, "sing-box service started")
+            stage("startOrReloadService") {
+                server.startOrReloadService(json, null)
+            }
 
             // 5. foreground notification + статистика
             startForeground(NOTIF_ID, buildNotification(currentTag))

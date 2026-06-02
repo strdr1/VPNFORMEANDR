@@ -31,6 +31,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.BufferedReader
+import java.io.File
 import java.io.InputStreamReader
 
 /**
@@ -49,7 +50,18 @@ fun DiagnosticsTab() {
 
     fun refresh() {
         scope.launch {
-            log = withContext(Dispatchers.IO) { readLogcat() }
+            log = withContext(Dispatchers.IO) {
+                buildString {
+                    appendLine("=== CRASH.LOG (наши Java-исключения) ===")
+                    appendLine(readFile(File(ctx.filesDir, "crash.log")))
+                    appendLine()
+                    appendLine("=== STDERR.LOG (паники Go / sing-box) ===")
+                    appendLine(readFile(File(ctx.filesDir, "stderr.log")))
+                    appendLine()
+                    appendLine("=== LOGCAT (последние 500 строк) ===")
+                    appendLine(readLogcat())
+                }
+            }
         }
     }
 
@@ -111,6 +123,19 @@ fun DiagnosticsTab() {
     }
 }
 
+private fun readFile(f: File): String {
+    if (!f.exists() || f.length() == 0L) return "(пусто)"
+    return try {
+        val max = 64 * 1024L
+        if (f.length() <= max) f.readText()
+        else f.inputStream().use { s ->
+            s.skip(f.length() - max); String(s.readBytes())
+        }
+    } catch (e: Exception) {
+        "ошибка чтения ${f.name}: ${e.message}"
+    }
+}
+
 /** Читает logcat за последние ~5 минут, фильтрует по нашим тегам. */
 private fun readLogcat(): String {
     return try {
@@ -118,10 +143,17 @@ private fun readLogcat(): String {
         val process = ProcessBuilder(
             "logcat", "-d", "-t", "500",
             "AmSalesVpnService:V",
+            "AmSalesPlatform:V",
+            "AmSalesCrash:V",
             "sing-box:V",
+            "libbox:V",
             "AmSales:V",
             "VpnState:V",
-            "*:S"   // молчать про всё остальное
+            "AndroidRuntime:E",
+            "DEBUG:V",
+            "Go:V",
+            "GoLog:V",
+            "*:S"
         ).redirectErrorStream(true).start()
         val sb = StringBuilder()
         BufferedReader(InputStreamReader(process.inputStream)).useLines { lines ->
