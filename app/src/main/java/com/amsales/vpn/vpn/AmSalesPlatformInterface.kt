@@ -5,7 +5,10 @@ import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.os.Process
 import android.util.Log
@@ -337,12 +340,32 @@ class AmSalesPlatformInterface(
             }
         }
 
+        // Подписка — точно по эталону SagerNet DefaultNetworkListener.
+        // Главное: на API 28+ используем requestNetwork с NetworkRequest
+        // требующим NOT_VPN/NOT_RESTRICTED — иначе registerDefaultNetworkCallback
+        // отдаёт нам наш собственный TUN (Android после establish() считает
+        // VPN default-сетью), и sing-box заворачивает трафик обратно в TUN.
         try {
-            cm.registerDefaultNetworkCallback(cb)
+            // NOT_RESTRICTED исключает VPN-сети автоматически
+            // (VPN всегда помечается как RESTRICTED → не имеет NOT_RESTRICTED)
+            val req = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
+                .build()
+            val mainHandler = Handler(Looper.getMainLooper())
+            if (Build.VERSION.SDK_INT >= 31) {
+                cm.registerBestMatchingNetworkCallback(req, cb, mainHandler)
+            } else if (Build.VERSION.SDK_INT >= 28) {
+                cm.requestNetwork(req, cb, mainHandler)
+            } else if (Build.VERSION.SDK_INT >= 26) {
+                cm.registerDefaultNetworkCallback(cb, mainHandler)
+            } else {
+                cm.registerDefaultNetworkCallback(cb)
+            }
             callbackRef.set(cb)
-            Log.i(TAG, "default-interface monitor started (ready in 2s)")
+            Log.i(TAG, "default-interface monitor started (API ${Build.VERSION.SDK_INT}, ready in 2s)")
         } catch (e: Throwable) {
-            Log.e(TAG, "registerDefaultNetworkCallback", e)
+            Log.e(TAG, "register network callback failed", e)
         }
     }
 
@@ -384,6 +407,16 @@ class AmSalesPlatformInterface(
 
                     if (name.isEmpty() || index <= 0) {
                         Log.w(TAG, "$source: cannot resolve interface")
+                        return@execute
+                    }
+
+                    // КРИТИЧНО: НЕ сообщаем sing-box что наш собственный TUN
+                    // стал default. Android после establish() переключает
+                    // default network на VPN-туннель, и наш callback получает
+                    // tun0 как default. Если передать его sing-box'у — он
+                    // станет роутить трафик через TUN → loop → инета нет.
+                    if (name.startsWith("tun") || name == "amsales0") {
+                        Log.d(TAG, "$source: skip TUN-interface $name (own VPN)")
                         return@execute
                     }
 
