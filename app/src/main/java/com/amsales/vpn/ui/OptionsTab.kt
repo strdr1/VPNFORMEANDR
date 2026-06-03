@@ -81,16 +81,25 @@ fun OptionsTab() {
         }
         Divider()
 
-        // Обход DPI — выбор сервисов
-        Spacer(Modifier.height(12.dp))
+        // Обход DPI — мастер-toggle + список сервисов
+        var zapretOn by remember { mutableStateOf(repo.useZapret) }
+        ToggleRow(
+            title = "Обход DPI (zapret)",
+            subtitle = "Главный переключатель. Когда выключен — список ниже игнорируется.",
+            checked = zapretOn
+        ) {
+            zapretOn = it; repo.useZapret = it
+        }
+        Divider()
+
+        Spacer(Modifier.height(8.dp))
         Text(
-            "Обход DPI (без VPN)",
+            "Сервисы для обхода DPI",
             color = AmTextHi, fontSize = 14.sp, fontWeight = FontWeight.Medium
         )
         Text(
             "Выбранные сервисы идут НАПРЯМУЮ с фрагментацией TLS — провайдер " +
-                "не видит SNI и не блокирует. Скорость как у обычного интернета, " +
-                "реклама региональная (можно блокировщиком).",
+                "не видит SNI и не блокирует. Реклама региональная (российский IP).",
             color = AmTextLo, fontSize = 11.sp
         )
         Spacer(Modifier.height(8.dp))

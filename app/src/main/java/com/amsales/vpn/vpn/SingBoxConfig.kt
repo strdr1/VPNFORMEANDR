@@ -173,10 +173,13 @@ object SingBoxConfig {
         // DPI-обход: выбранные пользователем сервисы (YouTube/Discord/etc)
         // идут НЕ через VPN и НЕ через direct, а через наш локальный
         // SOCKS5-прокси который фрагментирует TLS Client Hello.
+        // Учитываем мастер-toggle useZapret — если выключен, список игнорируется.
         val dpiDomains = JSONArray()
-        for (id in settings.dpiServices) {
-            val svc = com.amsales.vpn.data.DpiServices.byId(id) ?: continue
-            for (d in svc.domains) dpiDomains.put(d)
+        if (settings.useZapret) {
+            for (id in settings.dpiServices) {
+                val svc = com.amsales.vpn.data.DpiServices.byId(id) ?: continue
+                for (d in svc.domains) dpiDomains.put(d)
+            }
         }
         if (dpiDomains.length() > 0) {
             rules.put(JSONObject()
@@ -205,8 +208,8 @@ object SingBoxConfig {
         }
 
         // SOCKS5 outbound на наш локальный DPI-фрагментирующий прокси.
-        // Включаем только если есть выбранные DPI-сервисы.
-        val dpiBypass = if (settings.dpiServices.isNotEmpty()) {
+        // Включаем только если есть выбранные DPI-сервисы и включён zapret.
+        val dpiBypass = if (settings.useZapret && settings.dpiServices.isNotEmpty()) {
             JSONObject().apply {
                 put("type", "socks")
                 put("tag", "dpi-bypass")

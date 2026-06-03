@@ -125,18 +125,29 @@ class AmSalesVpnService : VpnService() {
             VpnState.broadcast(applicationContext, "connecting", tag = currentTag)
 
             // 1. перенаправляем Go-stderr в файл (для Go-паник)
-            val baseDir = File(applicationContext.filesDir, "sing-box").apply { mkdirs() }
-            val workDir = File(baseDir, "work").apply { mkdirs() }
-            val tmpDir = File(applicationContext.cacheDir, "sing-box").apply { mkdirs() }
-            val stderrPath = File(applicationContext.filesDir, "stderr.log").absolutePath
-
-            // Чистим work-dir и tmp-dir от старого state — иначе sing-box
-            // может подхватить кеш DNS / соединений с предыдущего запуска
-            // и игнорировать новые DPI/route правила.
+            //
+            // Базовый каталог делаем УНИКАЛЬНЫМ на каждый запуск —
+            // sing-box не подхватит DNS-кеш / connection-pool / TLS-session
+            // с предыдущего запуска. Это решает баг "выключил YouTube из
+            // списка а трафик всё равно идёт старым путём".
+            val rootDir = File(applicationContext.filesDir, "sing-box").apply { mkdirs() }
+            // Удаляем все старые сессионные подпапки (старше 1 минуты)
             try {
-                workDir.listFiles()?.forEach { it.deleteRecursively() }
-                tmpDir.listFiles()?.forEach { it.deleteRecursively() }
+                val now = System.currentTimeMillis()
+                rootDir.listFiles()?.forEach { f ->
+                    if (f.isDirectory && f.name.startsWith("session-")) {
+                        if (now - f.lastModified() > 60_000) {
+                            f.deleteRecursively()
+                        }
+                    }
+                }
             } catch (_: Exception) {}
+
+            val sessionId = System.currentTimeMillis().toString()
+            val baseDir = File(rootDir, "session-$sessionId").apply { mkdirs() }
+            val workDir = File(baseDir, "work").apply { mkdirs() }
+            val tmpDir = File(applicationContext.cacheDir, "sing-box-$sessionId").apply { mkdirs() }
+            val stderrPath = File(applicationContext.filesDir, "stderr.log").absolutePath
 
             stage("redirectStderr") {
                 try { Libbox.redirectStderr(stderrPath) }
@@ -183,10 +194,9 @@ class AmSalesVpnService : VpnService() {
             }
             commandServer = server
 
-            // 4. Если есть DPI-сервисы — поднимаем локальный TLS-фрагментирующий
-            // SOCKS5-прокси на 127.0.0.1:DPI_PORT. sing-box будет ходить через
-            // него для youtube/spotify/etc.
-            if (repo.dpiServices.isNotEmpty()) {
+            // 4. Если есть DPI-сервисы И включён мастер-toggle — поднимаем
+            // локальный TLS-фрагментирующий SOCKS5-прокси.
+            if (repo.useZapret && repo.dpiServices.isNotEmpty()) {
                 stage("DPI SOCKS server start") {
                     val ds = com.amsales.vpn.dpi.DpiSocksServer(DPI_PORT)
                     ds.start()
@@ -274,6 +284,25 @@ class AmSalesVpnService : VpnService() {
     private fun cleanup() {
         try { dpiServer?.stop() } catch (_: Exception) {}
         dpiServer = null
+        // Чистим session-папки старее 30 секунд (не текущую — sing-box ещё
+        // может писать в неё лог).
+        try {
+            val rootDir = File(applicationContext.filesDir, "sing-box")
+            val cutoff = System.currentTimeMillis() - 30_000
+            rootDir.listFiles()?.forEach { f ->
+                if (f.isDirectory && f.name.startsWith("session-")
+                    && f.lastModified() < cutoff) {
+                    f.deleteRecursively()
+                }
+            }
+            val cacheRoot = applicationContext.cacheDir
+            cacheRoot.listFiles()?.forEach { f ->
+                if (f.isDirectory && f.name.startsWith("sing-box-")
+                    && f.lastModified() < cutoff) {
+                    f.deleteRecursively()
+                }
+            }
+        } catch (_: Exception) {}
         try { commandServer?.closeService() } catch (e: Exception) { Log.w(TAG, "closeService: ${e.message}") }
         // Не закрываем тут tunFd сразу — sing-box дюпает fd на Go-side,
         // и его горутины могут ещё использовать наш fd 500ms-1s после

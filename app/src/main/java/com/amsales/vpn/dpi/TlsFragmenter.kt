@@ -5,100 +5,67 @@ import java.net.Socket
 import kotlin.random.Random
 
 /**
- * Агрессивный TLS-фрагментатор как у zapret/GoodbyeDPI с режимом
- * `--dpi-desync=fake,multisplit`.
+ * TLS-фрагментация на TCP-уровне для обхода DPI (без root).
  *
- * Стратегии (применяются вместе, для надёжности):
- *   1. FAKE — отправляем сначала "мусорный" TLS-фрейм с фейковым SNI
- *      (например googlevideo.com), DPI его видит, пропускает.
- *      Но это **поддельный** пакет с TTL=1 — он не дойдёт до сервера,
- *      сервер не видит его. Через secs шлём настоящий ClientHello.
- *      На Android без root TTL не управляется → этот режим пропускаем.
- *   2. MULTISPLIT — режем ClientHello на N (3-5) фрагментов в рандомных
- *      позициях, с маленькой паузой между ними. DPI пытается найти SNI
- *      в каждом TCP-сегменте отдельно — и не находит.
- *   3. POSITION RANDOMIZATION — каждый раз сплиты в разных местах,
- *      DPI не успевает выучить паттерн.
- *   4. TCP_NODELAY + Thread.sleep между write — гарантия что Linux/Android
- *      не склеит сегменты обратно.
- *   5. JUNK PACKET — после реального ClientHello шлём 1-2 байта мусора
- *      чтобы DPI принял весь поток за уже-открытое-соединение.
+ * Подход (по образцу byedpi --split=N + рабочих 2026 zapret-пресетов):
+ *  1. Резать ClientHello на МЕЛКИЕ куски (особенно первые 30-100 байт)
+ *     именно на TCP-уровне через write+flush+sleep.
+ *  2. Точки разрезов:
+ *     a) В первых 10 байт (рвём record header — provider не парсит)
+ *     b) Перед SNI (host_pos)
+ *     c) В середине SNI hostname
+ *     d) После SNI
+ *  3. Между write() — sleep 5-15мс. Это **гарантирует** что Linux
+ *     TCP layer отправит каждый кусок отдельным сегментом (иначе
+ *     при tcpNoDelay=false он может собрать всё в один сегмент).
+ *  4. tcpNoDelay = true для немедленного отправки.
  *
- * На Android без root мы не можем менять TTL → fake-пакеты не сработают.
- * Используем MULTISPLIT + RANDOMIZATION + JUNK.
+ * Никаких манипуляций с TLS record-type или TLS-level фрагментацией —
+ * это рискует сломать handshake. Только разделение на TCP-уровне.
  */
 object TlsFragmenter {
 
-    /** Шлёт data в out, разрывая TLS Client Hello на несколько фрагментов. */
     fun sendWithFragmentation(socket: Socket, out: OutputStream, data: ByteArray) {
         if (!looksLikeTlsClientHello(data)) {
             out.write(data); out.flush()
             return
         }
-
-        // Forced TCP push between writes
         socket.tcpNoDelay = true
 
-        // Выбираем стратегию рандомно — DPI не успевает выучить паттерн
-        val strategy = Random.nextInt(3)
-        when (strategy) {
-            0 -> multisplitBySni(out, data)
-            1 -> multisplitRandom(out, data, parts = Random.nextInt(3, 6))
-            2 -> multisplitTiny(out, data)
-        }
-    }
-
-    /** Стратегия 0: режем посередине SNI + ещё в одной случайной точке до него. */
-    private fun multisplitBySni(out: OutputStream, data: ByteArray) {
-        val sniRange = findSniRange(data)
-        if (sniRange == null) {
-            multisplitRandom(out, data, 4)
-            return
-        }
-        val sniMid = sniRange.first + (sniRange.second - sniRange.first) / 2
-        // Дополнительный сплит до SNI чтобы header тоже не был целым
-        val preSplit = Random.nextInt(10, sniRange.first.coerceAtMost(data.size - 1))
-        val cuts = sortedSetOf(preSplit, sniMid).filter { it in 1 until data.size }
-        sendSplits(out, data, cuts)
-    }
-
-    /** Стратегия 1: N случайных сплитов по всей длине. */
-    private fun multisplitRandom(out: OutputStream, data: ByteArray, parts: Int) {
-        if (data.size < parts) {
-            out.write(data); out.flush(); return
-        }
+        // Находим SNI чтобы рвать прицельно
+        val sni = findSniRange(data)
         val cuts = sortedSetOf<Int>()
-        repeat(parts - 1) {
-            cuts.add(Random.nextInt(5, data.size - 1))
-        }
-        sendSplits(out, data, cuts.toList())
-    }
 
-    /** Стратегия 2: мелкие куски по 1-4 байта в начале (рвём record-header). */
-    private fun multisplitTiny(out: OutputStream, data: ByteArray) {
-        if (data.size < 10) { out.write(data); out.flush(); return }
-        val cuts = mutableListOf<Int>()
-        var p = Random.nextInt(1, 4)
-        cuts.add(p)
-        p += Random.nextInt(1, 4)
-        cuts.add(p)
-        p += Random.nextInt(10, 30)
-        if (p < data.size) cuts.add(p)
-        // потом большой кусок, потом ещё один в районе SNI
-        findSniRange(data)?.let { sni ->
-            val mid = sni.first + (sni.second - sni.first) / 2
-            if (mid > p + 5) cuts.add(mid)
+        if (sni != null) {
+            // Прицельные разрезы вокруг SNI — самый эффективный
+            val (sStart, sEnd) = sni
+            // Точка перед SNI (где провайдер ожидает увидеть hostname)
+            cuts.add(sStart)
+            // Точка в МИДДЛЕ SNI (рвём название домена)
+            cuts.add(sStart + (sEnd - sStart) / 2)
+            // Точка сразу после SNI
+            if (sEnd < data.size) cuts.add(sEnd)
+            // Ранний split — рвём TLS header
+            cuts.add(Random.nextInt(3, 8))
+        } else {
+            // Fallback — много случайных мелких кусков в начале
+            cuts.add(Random.nextInt(1, 5))
+            cuts.add(Random.nextInt(5, 15))
+            cuts.add(Random.nextInt(20, 50))
+            cuts.add(Random.nextInt(50, 100).coerceAtMost(data.size - 1))
         }
-        sendSplits(out, data, cuts.filter { it in 1 until data.size })
-    }
 
-    private fun sendSplits(out: OutputStream, data: ByteArray, cuts: List<Int>) {
+        // Дополнительно — обязательно рвём record header
+        cuts.add(1)
+        cuts.add(3)
+
+        // Отправляем по кускам с задержкой
         var prev = 0
-        for (c in cuts) {
-            if (c <= prev || c >= data.size) continue
+        for (c in cuts.filter { it in 1 until data.size }) {
+            if (c <= prev) continue
             out.write(data, prev, c - prev); out.flush()
-            // Микро-пауза: Linux пушит сегмент в проводу
-            sleepMicro()
+            // Sleep 5-15мс гарантирует отдельные TCP-сегменты
+            sleepMs(Random.nextInt(5, 15))
             prev = c
         }
         if (prev < data.size) {
@@ -106,12 +73,8 @@ object TlsFragmenter {
         }
     }
 
-    private fun sleepMicro() {
-        // ~0.5-2 мс случайно — провоцирует TCP_PUSH
-        try {
-            val ns = Random.nextLong(500_000L, 2_000_000L)
-            Thread.sleep(ns / 1_000_000L, (ns % 1_000_000L).toInt())
-        } catch (_: InterruptedException) {}
+    private fun sleepMs(ms: Int) {
+        try { Thread.sleep(ms.toLong()) } catch (_: InterruptedException) {}
     }
 
     private fun looksLikeTlsClientHello(d: ByteArray): Boolean {
@@ -122,10 +85,6 @@ object TlsFragmenter {
         return true
     }
 
-    /**
-     * Находит позицию SNI hostname внутри TLS Client Hello.
-     * Возвращает (offsetStart, offsetEnd) — диапазон строки hostname.
-     */
     private fun findSniRange(d: ByteArray): Pair<Int, Int>? {
         try {
             var p = 9

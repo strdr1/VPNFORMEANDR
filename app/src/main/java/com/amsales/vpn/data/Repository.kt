@@ -86,8 +86,11 @@ class Repository(private val context: Context) {
         get() = context.prefs().getBoolean("route_ru_direct", true)
         set(v) { context.prefs().edit().putBoolean("route_ru_direct", v).apply() }
 
+    /** Глобальный toggle: применять ли DPI-обход (zapret).
+     *  Если false — dpiServices игнорируются. Удобно для быстрого
+     *  on/off без потери списка сервисов. */
     var useZapret: Boolean
-        get() = context.prefs().getBoolean("use_zapret", false)
+        get() = context.prefs().getBoolean("use_zapret", true)
         set(v) { context.prefs().edit().putBoolean("use_zapret", v).apply() }
 
     /** Какие сервисы пропускать через DPI-обход (фрагментация TLS).
