@@ -155,7 +155,17 @@ object SingBoxConfig {
         val route = JSONObject().apply {
             put("rules", rules)
             put("final", "proxy")
+            // auto_detect_interface на Android по официальной доке
+            // ("supported on Linux/Windows/macOS, NOT Android")
+            // работает только в паре с override_android_vpn=true.
+            // Без override_android_vpn sing-box НЕ принимает наш VpnService
+            // как upstream — и трафик никуда не идёт, хотя ошибок нет.
             put("auto_detect_interface", true)
+            put("override_android_vpn", true)
+            // НЕ зовём findConnectionOwner если нет правил с process_name —
+            // на Android 13 у нас Build.VERSION >= Q, но всё равно лишний
+            // round-trip через JNI на каждом пакете.
+            put("find_process", false)
         }
 
         val direct = JSONObject().apply {

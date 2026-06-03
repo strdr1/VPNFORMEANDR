@@ -137,6 +137,10 @@ class AmSalesVpnService : VpnService() {
                 val setup = SetupOptions().apply {
                     basePath = baseDir.absolutePath
                     workingPath = workDir.absolutePath
+                    // как у SagerNet (sing-box-for-android):
+                    fixAndroidStack = true
+                    logMaxLines = 3000
+                    debug = false
                     tempPath = tmpDir.absolutePath
                 }
                 Libbox.setup(setup)

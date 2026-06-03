@@ -5,10 +5,11 @@ import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
-import android.net.NetworkRequest
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.Process
 import android.util.Log
+import androidx.annotation.RequiresApi
 import io.nekohasekai.libbox.ConnectionOwner
 import io.nekohasekai.libbox.InterfaceUpdateListener
 import io.nekohasekai.libbox.LocalDNSTransport
@@ -19,23 +20,17 @@ import io.nekohasekai.libbox.PlatformInterface
 import io.nekohasekai.libbox.StringIterator
 import io.nekohasekai.libbox.TunOptions
 import io.nekohasekai.libbox.WIFIState
+import java.net.InetSocketAddress
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Реализация libbox.PlatformInterface — мост между Java/Kotlin и Go-кодом
- * sing-box.
+ * Реализация libbox.PlatformInterface — следует эталону sing-box-for-android.
  *
- * Самый важный метод — openTun(options): здесь мы поднимаем
- * VpnService.Builder с параметрами от sing-box, делаем establish() и
- * возвращаем целочисленный fd, который Go-сторона использует как TUN.
- *
- * Также критично:
- *   - getInterfaces(): возвращает реальные сетевые интерфейсы Android
- *     (БЕЗ нашего TUN — иначе sing-box зациклится на нём как на upstream).
- *   - startDefaultInterfaceMonitor: подписывается на ConnectivityManager
- *     и сообщает sing-box какой интерфейс является default, чтобы
- *     auto_detect_interface работал. Без этого direct-outbound и TLS-DNS
- *     с detour=proxy не имеют upstream — трафик не идёт.
+ * Главные паттерны:
+ *  - useProcFS=true ТОЛЬКО на Android < Q (на Q+ procfs закрыт)
+ *  - findConnectionOwner через ConnectivityManager.getConnectionOwnerUid (API 29+)
+ *  - default-interface monitor с retry-логикой (100ms x 10)
+ *  - getInterfaces через ConnectivityManager.allNetworks (а не JDK)
  */
 class AmSalesPlatformInterface(
     private val service: AmSalesVpnService,
@@ -44,18 +39,12 @@ class AmSalesPlatformInterface(
 
     @Volatile var tunFd: ParcelFileDescriptor? = null
         private set
-    @Volatile private var tunName: String = "tun0"
+    @Volatile private var tunName: String = ""
 
-    private val cm: ConnectivityManager? =
-        service.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+    private val cm: ConnectivityManager =
+        service.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
     private val callbackRef = AtomicReference<ConnectivityManager.NetworkCallback?>(null)
-    private val currentDefault = AtomicReference<DefaultInterface?>(null)
-
-    private data class DefaultInterface(
-        val name: String, val index: Int,
-        val isExpensive: Boolean, val isConstrained: Boolean,
-    )
 
     override fun openTun(options: TunOptions): Int {
         Log.i(TAG, "openTun: MTU=${options.mtu}, autoRoute=${options.autoRoute}")
@@ -64,12 +53,11 @@ class AmSalesPlatformInterface(
             .setSession("AM.SALES VPN")
             .setMtu(options.mtu.coerceAtLeast(1280))
 
-        // IPv4 addresses
         val v4iter = options.inet4Address
         while (v4iter != null && v4iter.hasNext()) {
             val p = v4iter.next() ?: continue
             try { builder.addAddress(p.address(), p.prefix()) }
-            catch (e: Exception) { Log.w(TAG, "addAddress v4 failed: ${e.message}") }
+            catch (e: Exception) { Log.w(TAG, "addAddress v4: ${e.message}") }
         }
         val v6iter = options.inet6Address
         while (v6iter != null && v6iter.hasNext()) {
@@ -78,7 +66,6 @@ class AmSalesPlatformInterface(
             catch (_: Exception) {}
         }
 
-        // Routes: если sing-box передал — используем; иначе дефолт 0.0.0.0/0
         var routesAdded = false
         val r4 = options.inet4RouteAddress
         while (r4 != null && r4.hasNext()) {
@@ -92,31 +79,18 @@ class AmSalesPlatformInterface(
             try { builder.addRoute(p.address(), p.prefix()); routesAdded = true }
             catch (_: Exception) {}
         }
-        if (!routesAdded) {
-            builder.addRoute("0.0.0.0", 0)
-        }
+        if (!routesAdded) builder.addRoute("0.0.0.0", 0)
 
-        // DNS — используем фиксированный (системный потом перехватим
-        // через hijack-dns правило в sing-box)
         try {
             val dns = options.dnsServerAddress
-            if (dns != null && dns.value.isNotBlank()) {
-                builder.addDnsServer(dns.value)
-            } else {
-                builder.addDnsServer("1.1.1.1")
-                builder.addDnsServer("8.8.8.8")
-            }
-        } catch (_: Exception) {
-            builder.addDnsServer("1.1.1.1")
-        }
+            if (dns != null && dns.value.isNotBlank()) builder.addDnsServer(dns.value)
+            else { builder.addDnsServer("1.1.1.1"); builder.addDnsServer("8.8.8.8") }
+        } catch (_: Exception) { builder.addDnsServer("1.1.1.1") }
 
-        // Split tunneling
         for (pkg in blacklistApps) {
             try { builder.addDisallowedApplication(pkg) }
             catch (e: Exception) { Log.w(TAG, "skip $pkg: ${e.message}") }
         }
-        // ОБЯЗАТЕЛЬНО: сам себя — мимо туннеля. Без этого sing-box internal
-        // сокеты замыкаются.
         try { builder.addDisallowedApplication(service.packageName) } catch (_: Exception) {}
 
         val excl: StringIterator? = options.excludePackage
@@ -131,101 +105,172 @@ class AmSalesPlatformInterface(
         }
 
         val pfd = builder.establish()
-            ?: throw RuntimeException("VpnService.Builder.establish() вернул null — нет разрешения?")
+            ?: throw RuntimeException("VpnService.Builder.establish() = null — нет разрешения?")
         tunFd = pfd
 
-        // Запомнили имя TUN-интерфейса чтобы исключить из getInterfaces.
-        tunName = guessTunName(pfd.fd)
+        // Имя TUN — для exclude из getInterfaces. Ищем интерфейс с нашим адресом.
+        tunName = try {
+            java.net.NetworkInterface.getNetworkInterfaces().toList().firstOrNull { ni ->
+                ni.inetAddresses.toList().any {
+                    it.hostAddress == AmSalesVpnService.TUN_ADDRESS
+                }
+            }?.name ?: "tun0"
+        } catch (_: Exception) { "tun0" }
 
-        Log.i(TAG, "TUN установлен, fd=${pfd.fd}, имя~$tunName")
+        Log.i(TAG, "TUN установлен fd=${pfd.fd} имя=$tunName")
         return pfd.fd
     }
 
-    private fun guessTunName(fd: Int): String {
-        // На Android VpnService туннели обычно называются tun0, tun1...
-        // Точно определить нельзя без ioctl. Берём все имена которые
-        // НЕ выглядят как обычные сетевые интерфейсы.
-        return try {
-            val all = java.net.NetworkInterface.getNetworkInterfaces().toList()
-            // Ищем интерфейс с адресом 172.19.0.1 (наш TUN_ADDRESS)
-            for (ni in all) {
-                for (addr in ni.inetAddresses.toList()) {
-                    if (addr.hostAddress == AmSalesVpnService.TUN_ADDRESS) {
-                        return ni.name
-                    }
-                }
-            }
-            "tun0"
-        } catch (_: Exception) { "tun0" }
-    }
-
     override fun autoDetectInterfaceControl(fd: Int) {
-        // Защита сокета — без этого исходящий коннект к VLESS-серверу
-        // зайдёт обратно в наш TUN и зациклится.
-        try {
-            val ok = service.protect(fd)
-            if (!ok) Log.w(TAG, "service.protect($fd) returned false")
-        } catch (e: Exception) {
-            Log.w(TAG, "protect($fd) failed: ${e.message}")
+        // У SagerNet ровно так — protect(fd) от VpnService.
+        try { service.protect(fd) } catch (e: Exception) {
+            Log.w(TAG, "protect($fd): ${e.message}")
         }
     }
 
     override fun usePlatformAutoDetectInterfaceControl(): Boolean = true
 
-    override fun useProcFS(): Boolean = true
+    // ЭТАЛОН SagerNet: procfs только на Android < Q.
+    // На Q+ /proc/net закрыт для приложений и FindConnectionOwner идёт
+    // через ConnectivityManager.getConnectionOwnerUid (см. ниже).
+    override fun useProcFS(): Boolean = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
 
     override fun includeAllNetworks(): Boolean = false
-
     override fun underNetworkExtension(): Boolean = false
-
-    override fun clearDNSCache() { /* no-op */ }
-
+    override fun clearDNSCache() {}
     override fun readWIFIState(): WIFIState? = null
-
     override fun localDNSTransport(): LocalDNSTransport? = null
-
     override fun systemCertificates(): StringIterator? = null
 
-    override fun getInterfaces(): NetworkInterfaceIterator {
-        return AndroidNetworkInterfaceIterator(tunName)
+    override fun findConnectionOwner(
+        ipProtocol: Int,
+        sourceAddress: String?,
+        sourcePort: Int,
+        destinationAddress: String?,
+        destinationPort: Int,
+    ): ConnectionOwner {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            throw Exception("findConnectionOwner unavailable on Android < Q")
+        }
+        return findConnectionOwnerQ(ipProtocol, sourceAddress ?: "", sourcePort,
+                                       destinationAddress ?: "", destinationPort)
     }
 
-    /** Перечисляет JDK NetworkInterface исключая наш TUN. */
-    private class AndroidNetworkInterfaceIterator(private val excludeTun: String) : NetworkInterfaceIterator {
-        private val iter: Iterator<java.net.NetworkInterface> = try {
-            java.net.NetworkInterface.getNetworkInterfaces()?.toList()
-                ?.filter { ni ->
-                    try {
-                        ni.isUp
-                            && ni.inetAddresses.toList().isNotEmpty()
-                            && ni.name != excludeTun
-                            && !ni.name.startsWith("tun")  // на всякий случай — все tun-ы
-                            && !ni.isLoopback
-                    } catch (_: Exception) { false }
-                }?.iterator()
-                ?: emptyList<java.net.NetworkInterface>().iterator()
-        } catch (_: Exception) {
-            emptyList<java.net.NetworkInterface>().iterator()
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun findConnectionOwnerQ(
+        ipProtocol: Int,
+        sourceAddress: String,
+        sourcePort: Int,
+        destinationAddress: String,
+        destinationPort: Int,
+    ): ConnectionOwner {
+        try {
+            val uid = cm.getConnectionOwnerUid(
+                ipProtocol,
+                InetSocketAddress(sourceAddress, sourcePort),
+                InetSocketAddress(destinationAddress, destinationPort),
+            )
+            if (uid == Process.INVALID_UID) throw Exception("connection owner not found")
+            val packages = service.packageManager.getPackagesForUid(uid)
+            val owner = ConnectionOwner()
+            owner.userId = uid
+            owner.userName = packages?.firstOrNull() ?: ""
+            // setAndroidPackageNames принимает StringIterator
+            owner.setAndroidPackageNames(ListStringIterator(packages?.toList() ?: emptyList()))
+            return owner
+        } catch (e: Exception) {
+            throw e
+        }
+    }
+
+    override fun getInterfaces(): NetworkInterfaceIterator {
+        // SagerNet делает через ConnectivityManager.allNetworks.
+        // Но для совместимости с Android < M используем JDK fallback.
+        return try {
+            val nets = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) cm.allNetworks else null
+            if (nets != null && nets.isNotEmpty()) {
+                CmInterfaceIterator(cm, nets.toList(), tunName)
+            } else {
+                JdkInterfaceIterator(tunName)
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "getInterfaces fallback: ${e.message}")
+            JdkInterfaceIterator(tunName)
+        }
+    }
+
+    private class CmInterfaceIterator(
+        private val cm: ConnectivityManager,
+        networks: List<Network>,
+        private val excludeTun: String,
+    ) : NetworkInterfaceIterator {
+
+        private val pending: MutableList<NetworkInterface> = run {
+            val out = mutableListOf<NetworkInterface>()
+            for (net in networks) {
+                try {
+                    val lp = cm.getLinkProperties(net) ?: continue
+                    val name = lp.interfaceName ?: continue
+                    if (name == excludeTun || name.startsWith("tun")) continue
+                    val ji = try { java.net.NetworkInterface.getByName(name) } catch (_: Exception) { null }
+                    val addrs = lp.linkAddresses.mapNotNull { it.address.hostAddress }
+                    val ni = NetworkInterface()
+                    ni.index = ji?.index ?: 0
+                    ni.mtu = try { ji?.mtu ?: 1500 } catch (_: Exception) { 1500 }
+                    ni.name = name
+                    ni.addresses = ListStringIterator(addrs)
+                    ni.flags = 0
+                    val caps = cm.getNetworkCapabilities(net)
+                    ni.type = when {
+                        caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true -> 0
+                        caps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true -> 1
+                        caps?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true -> 2
+                        else -> 3
+                    }
+                    val dnsServers = lp.dnsServers.mapNotNull { it.hostAddress }
+                    ni.dnsServer = ListStringIterator(dnsServers)
+                    ni.metered = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == false
+                    out.add(ni)
+                } catch (e: Exception) {
+                    Log.w(TAG, "interface skip: ${e.message}")
+                }
+            }
+            out
         }
 
+        private val iter = pending.iterator()
         override fun hasNext(): Boolean = iter.hasNext()
+        override fun next(): NetworkInterface = iter.next()
+    }
 
-        override fun next(): NetworkInterface {
-            val ni = iter.next()
-            val out = NetworkInterface()
-            out.index = ni.index
-            out.mtu = try { ni.mtu } catch (_: Exception) { 1500 }
-            out.name = ni.name
-            val addrs = ni.inetAddresses.toList()
-                .mapNotNull { it.hostAddress }
-                .filter { it.isNotBlank() }
-            out.addresses = ListStringIterator(addrs)
-            out.flags = 0
-            out.type = 0
-            out.dnsServer = ListStringIterator(emptyList())
-            out.metered = false
-            return out
+    private class JdkInterfaceIterator(excludeTun: String) : NetworkInterfaceIterator {
+        private val pending: MutableList<NetworkInterface> = run {
+            val out = mutableListOf<NetworkInterface>()
+            try {
+                java.net.NetworkInterface.getNetworkInterfaces()?.toList()?.forEach { ni ->
+                    try {
+                        if (!ni.isUp || ni.isLoopback) return@forEach
+                        if (ni.name == excludeTun || ni.name.startsWith("tun")) return@forEach
+                        val addrs = ni.inetAddresses.toList().mapNotNull { it.hostAddress }
+                        if (addrs.isEmpty()) return@forEach
+                        val o = NetworkInterface()
+                        o.index = ni.index
+                        o.mtu = try { ni.mtu } catch (_: Exception) { 1500 }
+                        o.name = ni.name
+                        o.addresses = ListStringIterator(addrs)
+                        o.flags = 0
+                        o.type = 3
+                        o.dnsServer = ListStringIterator(emptyList())
+                        o.metered = false
+                        out.add(o)
+                    } catch (_: Exception) {}
+                }
+            } catch (_: Exception) {}
+            out
         }
+        private val iter = pending.iterator()
+        override fun hasNext(): Boolean = iter.hasNext()
+        override fun next(): NetworkInterface = iter.next()
     }
 
     private class ListStringIterator(private val items: List<String>) : StringIterator {
@@ -235,88 +280,93 @@ class AmSalesPlatformInterface(
         override fun next(): String = iter.next()
     }
 
-    override fun findConnectionOwner(
-        ipProtocol: Int,
-        sourceAddress: String?,
-        sourcePort: Int,
-        destinationAddress: String?,
-        destinationPort: Int
-    ): ConnectionOwner {
-        // Бросаем Exception — иначе SIGSEGV в Go (см. ранний баг-репорт).
-        throw Exception("not implemented")
-    }
-
     override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener?) {
         listener ?: return
-        val mgr = cm ?: return
-
-        val request = NetworkRequest.Builder()
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            .build()
 
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                updateFromNetwork(network, listener)
-            }
-            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-                updateFromNetwork(network, listener, caps)
+                pushInterfaceUpdate(network, listener, "onAvailable")
             }
             override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
-                updateFromNetwork(network, listener, lp = lp)
+                pushInterfaceUpdate(network, listener, "onLink", lp = lp)
             }
             override fun onLost(network: Network) {
                 Log.i(TAG, "default network lost")
+                // SagerNet шлёт пустые значения при потере сети.
+                try {
+                    listener.updateDefaultInterface("", 0, false, false)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "updateDefaultInterface(empty): ${t.message}")
+                }
             }
         }
+
         try {
-            mgr.registerDefaultNetworkCallback(cb)
+            cm.registerDefaultNetworkCallback(cb)
             callbackRef.set(cb)
             Log.i(TAG, "default-interface monitor started")
-        } catch (e: Exception) {
-            Log.w(TAG, "registerDefaultNetworkCallback failed: ${e.message}")
+        } catch (e: Throwable) {
+            Log.e(TAG, "registerDefaultNetworkCallback", e)
         }
     }
 
-    private fun updateFromNetwork(
+    /** SagerNet-стиль: retry до 10 раз с 100ms delay чтобы дождаться NetworkInterface. */
+    private fun pushInterfaceUpdate(
         network: Network,
         listener: InterfaceUpdateListener,
-        caps: NetworkCapabilities? = null,
+        source: String,
         lp: LinkProperties? = null,
     ) {
-        try {
-            val name = (lp ?: cm?.getLinkProperties(network))?.interfaceName
-                ?: return
-            val ji = try { java.net.NetworkInterface.getByName(name) } catch (_: Exception) { null }
-            val index = ji?.index ?: 0
-            val capsR = caps ?: cm?.getNetworkCapabilities(network)
-            val isExpensive = capsR?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == false
-            val isConstrained = false
-
-            val di = DefaultInterface(name, index, isExpensive, isConstrained)
-            val prev = currentDefault.getAndSet(di)
-            if (prev != di) {
-                Log.i(TAG, "default interface: $name (index=$index, metered=$isExpensive)")
-                try {
-                    listener.updateDefaultInterface(name, index, isExpensive, isConstrained)
-                } catch (e: Exception) {
-                    Log.w(TAG, "updateDefaultInterface failed: ${e.message}")
+        Thread {
+            try {
+                var name = ""
+                var index = -1
+                for (attempt in 0 until 10) {
+                    try {
+                        val linkProps = lp ?: cm.getLinkProperties(network)
+                        name = linkProps?.interfaceName ?: ""
+                        if (name.isNotEmpty()) {
+                            val ji = java.net.NetworkInterface.getByName(name)
+                            if (ji != null) {
+                                index = ji.index
+                                break
+                            }
+                        }
+                    } catch (_: Throwable) {}
+                    try { Thread.sleep(100) } catch (_: InterruptedException) {}
                 }
+                if (name.isEmpty() || index < 0) {
+                    Log.w(TAG, "$source: failed to resolve interface after 10 retries")
+                    return@Thread
+                }
+
+                val caps = try { cm.getNetworkCapabilities(network) } catch (_: Throwable) { null }
+                val metered = try {
+                    caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == false
+                } catch (_: Throwable) { false }
+
+                Log.i(TAG, "default interface: $name index=$index metered=$metered ($source)")
+                try {
+                    listener.updateDefaultInterface(name, index, metered, false)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "updateDefaultInterface: ${t.message}")
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "pushInterfaceUpdate($source)", t)
             }
-        } catch (e: Exception) {
-            Log.w(TAG, "updateFromNetwork failed: ${e.message}")
-        }
+        }.start()
     }
 
     override fun closeDefaultInterfaceMonitor(listener: InterfaceUpdateListener?) {
         val cb = callbackRef.getAndSet(null) ?: return
-        try { cm?.unregisterNetworkCallback(cb) } catch (_: Exception) {}
+        try { cm.unregisterNetworkCallback(cb) } catch (_: Exception) {}
         Log.i(TAG, "default-interface monitor stopped")
     }
 
     override fun sendNotification(notification: Notification?) {
         notification ?: return
         try {
-            Log.i(TAG, "Notification from sing-box: ${notification.title} — ${notification.subtitle}")
+            Log.i(TAG, "sing-box notify: ${notification.title} — ${notification.subtitle}")
         } catch (_: Exception) {}
     }
 
