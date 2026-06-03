@@ -102,7 +102,15 @@ private fun BottomBar(active: Int, onSelect: (Int) -> Unit) {
                 selected = active == idx,
                 onClick = { onSelect(idx) },
                 icon = { Icon(icon, null) },
-                label = { Text(stringResource(lbl), fontSize = 10.sp) },
+                label = {
+                    Text(
+                        text = stringResource(lbl),
+                        fontSize = 10.sp,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Visible,
+                    )
+                },
                 colors = NavigationBarItemDefaults.colors(
                     selectedIconColor = AmAccent,
                     selectedTextColor = AmAccent,

@@ -134,11 +134,21 @@ object SingBoxConfig {
         rules.put(JSONObject()
             .put("protocol", "dns")
             .put("action", "hijack-dns"))
-        // Exclude самого VPN-сервера
-        rules.put(JSONObject()
-            .put("ip_cidr", JSONArray().put("${key.host}/32"))
-            .put("action", "route")
-            .put("outbound", "direct"))
+        // Exclude самого VPN-сервера. key.host может быть IP (45.92...)
+        // или доменом (для CF-Worker'а: amsales-vpn.danecc5678.workers.dev).
+        // ip_cidr принимает только IP — для домена используем domain.
+        val isIp = key.host.matches(Regex("""^[0-9.]+$|^[0-9a-fA-F:]+$"""))
+        if (isIp) {
+            rules.put(JSONObject()
+                .put("ip_cidr", JSONArray().put("${key.host}/32"))
+                .put("action", "route")
+                .put("outbound", "direct"))
+        } else {
+            rules.put(JSONObject()
+                .put("domain", JSONArray().put(key.host))
+                .put("action", "route")
+                .put("outbound", "direct"))
+        }
         val bypass = settings.bypassSites
         if (bypass.isNotEmpty()) {
             val bypassJson = JSONArray()

@@ -13,8 +13,8 @@
     <string name="tab_servers">Серверы</string>
     <string name="tab_apps">Приложения</string>
     <string name="tab_options">Опции</string>
-    <string name="tab_diag">Диагностика</string>
-    <string name="tab_about">О программе</string>
+    <string name="tab_diag">Логи</string>
+    <string name="tab_about">О нас</string>
 
     <!-- Вкладка Приложения -->
     <string name="apps_title">Приложения мимо VPN</string>

@@ -192,8 +192,14 @@ class AmSalesVpnService : VpnService() {
                 server.startOrReloadService(json, overrides)
             }
 
-            // 5. foreground notification + статистика
-            startForeground(NOTIF_ID, buildNotification(currentTag))
+            // 5. foreground notification + статистика. На Android 14+
+            // обязателен FOREGROUND_SERVICE_TYPE для специального типа.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(NOTIF_ID, buildNotification(currentTag),
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(NOTIF_ID, buildNotification(currentTag))
+            }
             isRunning = true
 
             rxBaseline = TrafficStats.getUidRxBytes(applicationInfo.uid).coerceAtLeast(0)

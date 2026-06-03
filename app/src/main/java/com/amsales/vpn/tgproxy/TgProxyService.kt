@@ -93,7 +93,12 @@ class TgProxyService : Service() {
             repo.tgProxyLink = currentLink
             Log.i(TAG, "TG-proxy started: $currentLink")
 
-            startForeground(NOTIF_ID, buildNotification(currentLink))
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(NOTIF_ID, buildNotification(currentLink),
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(NOTIF_ID, buildNotification(currentLink))
+            }
             broadcast(this, true, currentLink)
         } catch (e: Throwable) {
             Log.e(TAG, "TG-proxy start failed", e)
