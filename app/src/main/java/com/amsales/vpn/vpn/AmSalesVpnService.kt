@@ -126,6 +126,13 @@ class AmSalesVpnService : VpnService() {
             val repo = Repository(applicationContext)
             val isDpiOnly = repo.vpnMode == "dpi"
 
+            // В Zapret-режиме если юзер не выбрал ни одного сервиса —
+            // включаем YouTube по дефолту (иначе режим бесполезен).
+            if (isDpiOnly && repo.dpiServices.isEmpty()) {
+                repo.dpiServices = setOf("youtube")
+                Log.i(TAG, "DPI-only mode: auto-selected YouTube")
+            }
+
             val key = if (isDpiOnly) {
                 null  // DPI-only режим не требует VLESS-ключа
             } else {
@@ -211,7 +218,8 @@ class AmSalesVpnService : VpnService() {
 
             // 4. Если есть DPI-сервисы (или DPI-only режим) — поднимаем
             // локальный TLS-фрагментирующий SOCKS5-прокси.
-            val needDpi = (isDpiOnly || repo.useZapret) && repo.dpiServices.isNotEmpty()
+            // В DPI-only-режиме сервер обязателен (иначе режим бесполезен).
+            val needDpi = isDpiOnly || (repo.useZapret && repo.dpiServices.isNotEmpty())
             if (needDpi) {
                 stage("DPI SOCKS server start") {
                     val ds = com.amsales.vpn.dpi.DpiSocksServer(DPI_PORT)

@@ -67,12 +67,10 @@ object SingBoxConfig {
             put("final", "local")
         }
 
-        // Outbounds
+        // Outbounds — НЕТ `block`! В sing-box 1.13+ block outbound deprecated,
+        // блокировка делается через action: "reject" в route.rules.
         val direct = JSONObject().apply {
             put("type", "direct"); put("tag", "direct")
-        }
-        val block = JSONObject().apply {
-            put("type", "block"); put("tag", "block")
         }
         val dpiBypass = if (settings.dpiServices.isNotEmpty()) {
             JSONObject().apply {
@@ -91,12 +89,12 @@ object SingBoxConfig {
             .put("ip_cidr", JSONArray().put("127.0.0.0/8"))
             .put("action", "route").put("outbound", "direct"))
 
-        // Блокировка рекламы (Google ads)
+        // Блокировка рекламы (Google ads) — action: reject (sing-box 1.13+)
         val adJson = JSONArray()
         AD_DOMAINS.forEach { adJson.put(it) }
         rules.put(JSONObject()
             .put("domain_suffix", adJson)
-            .put("action", "route").put("outbound", "block"))
+            .put("action", "reject"))
 
         // DPI-обход
         if (dpiBypass != null) {
@@ -119,12 +117,12 @@ object SingBoxConfig {
             put("override_android_vpn", false)
         }
 
-        val obs = JSONArray().put(direct).put(block)
+        val obs = JSONArray().put(direct)
         if (dpiBypass != null) obs.put(dpiBypass)
 
         val root = JSONObject().apply {
             put("log", JSONObject()
-                .put("level", "warn").put("output", "stderr").put("timestamp", true))
+                .put("level", "debug").put("output", "stderr").put("timestamp", true))
             put("dns", dns)
             put("inbounds", JSONArray().put(tun))
             put("outbounds", obs)
@@ -267,13 +265,12 @@ object SingBoxConfig {
             .put("ip_cidr", JSONArray().put("127.0.0.0/8"))
             .put("action", "route")
             .put("outbound", "direct"))
-        // Блокировка рекламы YouTube/Google (доменный reject)
-        val adJson = JSONArray()
-        AD_DOMAINS.forEach { adJson.put(it) }
+        // Блокировка рекламы YouTube/Google — action: reject (sing-box 1.13+)
+        val adJsonMain = JSONArray()
+        AD_DOMAINS.forEach { adJsonMain.put(it) }
         rules.put(JSONObject()
-            .put("domain_suffix", adJson)
-            .put("action", "route")
-            .put("outbound", "block"))
+            .put("domain_suffix", adJsonMain)
+            .put("action", "reject"))
         // Exclude самого VPN-сервера. key.host может быть IP (45.92...)
         // или доменом (для CF-Worker'а: amsales-vpn.danecc5678.workers.dev).
         // ip_cidr принимает только IP — для домена используем domain.
@@ -343,10 +340,8 @@ object SingBoxConfig {
             put("type", "direct")
             put("tag", "direct")
         }
-        val block = JSONObject().apply {
-            put("type", "block")
-            put("tag", "block")
-        }
+        // НЕТ `block` outbound — в sing-box 1.13+ это deprecated.
+        // Блокировка делается через action: "reject" в route-правиле.
 
         // SOCKS5 outbound на наш локальный DPI-фрагментирующий прокси.
         // Включаем только если есть выбранные DPI-сервисы и включён zapret.
@@ -372,7 +367,6 @@ object SingBoxConfig {
             val obs = JSONArray()
                 .put(vless)
                 .put(direct)
-                .put(block)
             if (dpiBypass != null) obs.put(dpiBypass)
             put("outbounds", obs)
             put("route", route)
