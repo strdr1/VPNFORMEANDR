@@ -5,23 +5,29 @@ import java.net.Socket
 import kotlin.random.Random
 
 /**
- * TLS-фрагментация на TCP-уровне для обхода DPI (без root).
+ * TLS-фрагментация для обхода DPI на Android (без root).
  *
- * Подход (по образцу byedpi --split=N + рабочих 2026 zapret-пресетов):
- *  1. Резать ClientHello на МЕЛКИЕ куски (особенно первые 30-100 байт)
- *     именно на TCP-уровне через write+flush+sleep.
- *  2. Точки разрезов:
- *     a) В первых 10 байт (рвём record header — provider не парсит)
- *     b) Перед SNI (host_pos)
- *     c) В середине SNI hostname
- *     d) После SNI
- *  3. Между write() — sleep 5-15мс. Это **гарантирует** что Linux
- *     TCP layer отправит каждый кусок отдельным сегментом (иначе
- *     при tcpNoDelay=false он может собрать всё в один сегмент).
- *  4. tcpNoDelay = true для немедленного отправки.
+ * Комбинируем 2 техники которые работают без CAP_NET_RAW:
  *
- * Никаких манипуляций с TLS record-type или TLS-level фрагментацией —
- * это рискует сломать handshake. Только разделение на TCP-уровне.
+ * 1) TLS RECORD REFRAMING (главное):
+ *    Берём один большой TLS Handshake record (0x16) и разбиваем его на
+ *    2-3 валидных TLS record. Каждый record — короче 100 байт, со своим
+ *    5-байт header (тип=0x16, version=0x0303, length).
+ *
+ *    Сервер собирает Handshake message правильно (это легально по RFC 5246
+ *    §6.2.1 "Records may not span key changes" — внутри одного handshake
+ *    fragmentation разрешена).
+ *
+ *    DPI парсит КАЖДЫЙ TLS record по отдельности и ищет SNI extension в
+ *    нём. Если record короче чем оффсет SNI — DPI не находит SNI.
+ *
+ * 2) TCP SEGMENT SPLIT (дополнительно):
+ *    Между TLS record делаем write+flush+sleep — гарантия что Linux
+ *    отправит каждый TLS record отдельным TCP-сегментом.
+ *
+ * Это эквивалент `--dpi-desync=multisplit --dpi-desync-split-pos=1`
+ * из zapret/winws (без `fake`, `seqovl`, `fooling=ts` — они требуют
+ * raw socket).
  */
 object TlsFragmenter {
 
@@ -32,45 +38,58 @@ object TlsFragmenter {
         }
         socket.tcpNoDelay = true
 
-        // Находим SNI чтобы рвать прицельно
-        val sni = findSniRange(data)
-        val cuts = sortedSetOf<Int>()
+        // 5-байт TLS record header
+        val recVer1 = data[1]   // обычно 0x03
+        val recVer2 = data[2]   // обычно 0x01 или 0x03
+        val payload = data.copyOfRange(5, data.size)
 
-        if (sni != null) {
-            // Прицельные разрезы вокруг SNI — самый эффективный
-            val (sStart, sEnd) = sni
-            // Точка перед SNI (где провайдер ожидает увидеть hostname)
-            cuts.add(sStart)
-            // Точка в МИДДЛЕ SNI (рвём название домена)
-            cuts.add(sStart + (sEnd - sStart) / 2)
-            // Точка сразу после SNI
-            if (sEnd < data.size) cuts.add(sEnd)
-            // Ранний split — рвём TLS header
-            cuts.add(Random.nextInt(3, 8))
+        // Делим payload на 3 части. Cuts в payload-координатах.
+        // Первая часть — очень маленькая (1-5 байт) чтобы рвать header
+        // самого Handshake-сообщения. DPI не увидит длину Handshake.
+        val sniRange = findSniRangeInPayload(payload)
+        val cuts = mutableListOf<Int>()
+
+        cuts.add(Random.nextInt(1, 6))   // первый кусочек 1-5 байт
+
+        if (sniRange != null) {
+            val (sStart, sEnd) = sniRange
+            cuts.add(sStart)                                  // до hostname
+            cuts.add(sStart + (sEnd - sStart) / 2)            // середина hostname
         } else {
-            // Fallback — много случайных мелких кусков в начале
-            cuts.add(Random.nextInt(1, 5))
-            cuts.add(Random.nextInt(5, 15))
-            cuts.add(Random.nextInt(20, 50))
-            cuts.add(Random.nextInt(50, 100).coerceAtMost(data.size - 1))
+            // fallback — режем где-то в первой трети, потом в середине
+            cuts.add(payload.size / 4)
+            cuts.add(payload.size / 2)
         }
 
-        // Дополнительно — обязательно рвём record header
-        cuts.add(1)
-        cuts.add(3)
+        // Сортируем + убираем дубли/невалидные
+        val sortedCuts = cuts.toSortedSet().filter { it in 1 until payload.size }
 
-        // Отправляем по кускам с задержкой
+        // Шлём по TLS-record'у на каждый фрагмент
         var prev = 0
-        for (c in cuts.filter { it in 1 until data.size }) {
-            if (c <= prev) continue
-            out.write(data, prev, c - prev); out.flush()
-            // Sleep 5-15мс гарантирует отдельные TCP-сегменты
-            sleepMs(Random.nextInt(5, 15))
-            prev = c
+        for (cut in sortedCuts) {
+            if (cut <= prev) continue
+            sendTlsRecord(out, recVer1, recVer2, payload, prev, cut - prev)
+            sleepMs(Random.nextInt(5, 12))
+            prev = cut
         }
-        if (prev < data.size) {
-            out.write(data, prev, data.size - prev); out.flush()
+        if (prev < payload.size) {
+            sendTlsRecord(out, recVer1, recVer2, payload, prev, payload.size - prev)
         }
+    }
+
+    /** Отправляет один TLS Handshake record (тип 0x16) с заданным payload. */
+    private fun sendTlsRecord(
+        out: OutputStream, v1: Byte, v2: Byte,
+        src: ByteArray, off: Int, len: Int,
+    ) {
+        val rec = ByteArray(5 + len)
+        rec[0] = 0x16  // Handshake
+        rec[1] = v1
+        rec[2] = v2
+        rec[3] = ((len ushr 8) and 0xFF).toByte()
+        rec[4] = (len and 0xFF).toByte()
+        System.arraycopy(src, off, rec, 5, len)
+        out.write(rec); out.flush()
     }
 
     private fun sleepMs(ms: Int) {
@@ -85,35 +104,40 @@ object TlsFragmenter {
         return true
     }
 
-    private fun findSniRange(d: ByteArray): Pair<Int, Int>? {
+    /**
+     * Ищет позицию hostname внутри payload TLS Client Hello (БЕЗ 5-байт
+     * record-header). Координаты в payload, не в полном TLS record.
+     */
+    private fun findSniRangeInPayload(payload: ByteArray): Pair<Int, Int>? {
         try {
-            var p = 9
-            if (p + 2 > d.size) return null
-            p += 2
-            p += 32
-            if (p + 1 > d.size) return null
-            val sidLen = d[p].toInt() and 0xFF
+            // payload[0]=handshake_type(1)=01, payload[1..3]=length
+            var p = 4
+            if (p + 2 > payload.size) return null
+            p += 2   // client_version
+            p += 32  // random
+            if (p + 1 > payload.size) return null
+            val sidLen = payload[p].toInt() and 0xFF
             p += 1 + sidLen
-            if (p + 2 > d.size) return null
-            val csLen = ((d[p].toInt() and 0xFF) shl 8) or (d[p + 1].toInt() and 0xFF)
+            if (p + 2 > payload.size) return null
+            val csLen = ((payload[p].toInt() and 0xFF) shl 8) or (payload[p + 1].toInt() and 0xFF)
             p += 2 + csLen
-            if (p + 1 > d.size) return null
-            val cmLen = d[p].toInt() and 0xFF
+            if (p + 1 > payload.size) return null
+            val cmLen = payload[p].toInt() and 0xFF
             p += 1 + cmLen
-            if (p + 2 > d.size) return null
-            val extLen = ((d[p].toInt() and 0xFF) shl 8) or (d[p + 1].toInt() and 0xFF)
+            if (p + 2 > payload.size) return null
+            val extLen = ((payload[p].toInt() and 0xFF) shl 8) or (payload[p + 1].toInt() and 0xFF)
             p += 2
             val extEnd = p + extLen
-            if (extEnd > d.size) return null
+            if (extEnd > payload.size) return null
             while (p + 4 <= extEnd) {
-                val extType = ((d[p].toInt() and 0xFF) shl 8) or (d[p + 1].toInt() and 0xFF)
-                val extLength = ((d[p + 2].toInt() and 0xFF) shl 8) or (d[p + 3].toInt() and 0xFF)
+                val extType = ((payload[p].toInt() and 0xFF) shl 8) or (payload[p + 1].toInt() and 0xFF)
+                val extLength = ((payload[p + 2].toInt() and 0xFF) shl 8) or (payload[p + 3].toInt() and 0xFF)
                 p += 4
                 if (p + extLength > extEnd) return null
                 if (extType == 0x0000) {
                     if (extLength < 5) return null
                     val q = p + 5
-                    val hostLen = ((d[p + 3].toInt() and 0xFF) shl 8) or (d[p + 4].toInt() and 0xFF)
+                    val hostLen = ((payload[p + 3].toInt() and 0xFF) shl 8) or (payload[p + 4].toInt() and 0xFF)
                     if (q + hostLen > p + extLength) return null
                     return Pair(q, q + hostLen)
                 }

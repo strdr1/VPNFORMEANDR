@@ -21,19 +21,30 @@ object DpiServices {
             id = "youtube",
             title = "YouTube",
             description = "youtube.com, googlevideo.com — без рекламы и без VPN",
+            // Список доменов взят из zapret-discord-youtube 1.9.9a / list-google.txt
             domains = listOf(
                 "youtube.com", "youtu.be", "googlevideo.com",
                 "ggpht.com", "ytimg.com", "youtube-nocookie.com",
-                "yt3.ggpht.com", "i.ytimg.com",
+                "youtubekids.com", "youtubeembeddedplayer.googleapis.com",
+                "youtubei.googleapis.com", "googleusercontent.com",
+                "jnn-pa.googleapis.com",
+                "wide-youtube.l.google.com",
+                "youtube-ui.l.google.com",
+                "yt-video-upload.l.google.com",
+                "ytimg.l.google.com",
             ),
         ),
         DpiService(
             id = "discord",
             title = "Discord",
-            description = "discord.com, discord.gg",
+            description = "discord.com, discord.gg, голос и видео",
+            // Список из zapret-discord-youtube 1.9.9a / list-general.txt
             domains = listOf(
-                "discord.com", "discord.gg", "discordapp.com",
-                "discordapp.net", "discord.media",
+                "discord.com", "discord.gg", "discord.media",
+                "discordapp.com", "discordapp.net", "discordcdn.com",
+                "discord.app", "discord.dev", "discord.gift",
+                "discord-activities.com", "discordactivities.com",
+                "discordstatus.com", "discordsays.com",
             ),
         ),
         DpiService(
