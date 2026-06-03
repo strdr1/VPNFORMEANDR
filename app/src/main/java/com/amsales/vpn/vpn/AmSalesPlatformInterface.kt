@@ -160,38 +160,37 @@ class AmSalesPlatformInterface(
         destinationAddress: String?,
         destinationPort: Int,
     ): ConnectionOwner {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            throw Exception("findConnectionOwner unavailable on Android < Q")
-        }
-        return findConnectionOwnerQ(ipProtocol, sourceAddress ?: "", sourcePort,
-                                       destinationAddress ?: "", destinationPort)
-    }
+        // ВАЖНО: бросание Exception из gobind-callback'а на некоторых
+        // конфигурациях может вызвать SIGABRT в Go-runtime. Возвращаем
+        // валидный ConnectionOwner с userId=-1 (INVALID_UID) — это
+        // считается "не найдено" но не паникует.
+        val owner = ConnectionOwner()
+        owner.userId = -1
+        owner.userName = ""
+        owner.processPath = ""
+        owner.setAndroidPackageNames(ListStringIterator(emptyList()))
 
-    @RequiresApi(Build.VERSION_CODES.Q)
-    private fun findConnectionOwnerQ(
-        ipProtocol: Int,
-        sourceAddress: String,
-        sourcePort: Int,
-        destinationAddress: String,
-        destinationPort: Int,
-    ): ConnectionOwner {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return owner
+        }
+
         try {
+            val src = sourceAddress ?: return owner
+            val dst = destinationAddress ?: return owner
             val uid = cm.getConnectionOwnerUid(
                 ipProtocol,
-                InetSocketAddress(sourceAddress, sourcePort),
-                InetSocketAddress(destinationAddress, destinationPort),
+                InetSocketAddress(src, sourcePort),
+                InetSocketAddress(dst, destinationPort),
             )
-            if (uid == Process.INVALID_UID) throw Exception("connection owner not found")
-            val packages = service.packageManager.getPackagesForUid(uid)
-            val owner = ConnectionOwner()
+            if (uid == Process.INVALID_UID) return owner
             owner.userId = uid
+            val packages = try { service.packageManager.getPackagesForUid(uid) } catch (_: Throwable) { null }
             owner.userName = packages?.firstOrNull() ?: ""
-            // setAndroidPackageNames принимает StringIterator
             owner.setAndroidPackageNames(ListStringIterator(packages?.toList() ?: emptyList()))
-            return owner
-        } catch (e: Exception) {
-            throw e
+        } catch (_: Throwable) {
+            // глотаем — возвращаем owner с тем что успели заполнить
         }
+        return owner
     }
 
     override fun getInterfaces(): NetworkInterfaceIterator {
@@ -240,10 +239,23 @@ class AmSalesPlatformInterface(
         ni.name = name
         ni.index = ji.index
         ni.mtu = try { ji.mtu } catch (_: Exception) { 1500 }
-        // Адреса в формате "ip/prefix" — Go-side парсит как сетевой префикс.
-        val addrs = ji.interfaceAddresses.mapNotNull {
-            val a = it.address.hostAddress ?: return@mapNotNull null
-            "$a/${it.networkPrefixLength}"
+        // Адреса в формате "ip/prefix" — Go-side вызывает netip.MustParsePrefix
+        // который ПАНИКУЕТ если строка невалидна (например, IPv6 со
+        // zone-id "fe80::1%wlan0/64"). Чистим zone-id как у SagerNet.
+        val addrs = ji.interfaceAddresses.mapNotNull { ia ->
+            try {
+                val addr = ia.address ?: return@mapNotNull null
+                val cleaned = if (addr is java.net.Inet6Address) {
+                    // Inet6Address.getByAddress(raw bytes) убирает scope/zone
+                    java.net.Inet6Address.getByAddress(addr.address).hostAddress
+                } else {
+                    addr.hostAddress
+                } ?: return@mapNotNull null
+                // Дополнительная страховка — обрезаем zone-id если остался
+                val noZone = cleaned.substringBefore('%')
+                if (noZone.isEmpty()) return@mapNotNull null
+                "$noZone/${ia.networkPrefixLength}"
+            } catch (_: Throwable) { null }
         }
         ni.addresses = ListStringIterator(addrs)
         // Type — по transport.
@@ -266,8 +278,17 @@ class AmSalesPlatformInterface(
             if (ji.supportsMulticast()) flags = flags or android.system.OsConstants.IFF_MULTICAST
         } catch (_: Throwable) {}
         ni.flags = flags
-        // DNS-серверы
-        val dnsServers = lp?.dnsServers?.mapNotNull { it.hostAddress } ?: emptyList()
+        // DNS-серверы — без zone-id (страховка от паник в Go-парсерах)
+        val dnsServers = lp?.dnsServers?.mapNotNull { addr ->
+            try {
+                val raw = if (addr is java.net.Inet6Address) {
+                    java.net.Inet6Address.getByAddress(addr.address).hostAddress
+                } else {
+                    addr.hostAddress
+                } ?: return@mapNotNull null
+                raw.substringBefore('%').takeIf { it.isNotEmpty() }
+            } catch (_: Throwable) { null }
+        } ?: emptyList()
         ni.dnsServer = ListStringIterator(dnsServers)
         ni.metered = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == false
         return ni
