@@ -129,25 +129,42 @@ class DpiSocksServer(private val port: Int) {
             val uin = upstream.getInputStream()
             val uout = upstream.getOutputStream()
 
-            // client -> upstream (с фрагментацией первого write'а)
+            // client -> upstream (с фрагментацией первого пакета).
+            // Sing-box может слать TLS Client Hello несколькими write'ами —
+            // собираем их в один буфер пока он не выглядит как полный TLS-record,
+            // потом фрагментируем.
             val upJob = scope.launch {
                 try {
                     val buf = ByteArray(16384)
-                    var firstSent = false
+                    var fragmented = false
+                    val firstChunk = java.io.ByteArrayOutputStream()
+                    val firstReadDeadline = System.currentTimeMillis() + 300
+
                     while (isActive) {
                         val n = cin.read(buf)
                         if (n <= 0) break
-                        if (!firstSent) {
-                            // Первый клиентский пакет — фрагментируем (TLS).
-                            val payload = buf.copyOfRange(0, n)
-                            TlsFragmenter.sendWithFragmentation(uout, payload)
-                            firstSent = true
+
+                        if (!fragmented) {
+                            firstChunk.write(buf, 0, n)
+                            val arr = firstChunk.toByteArray()
+                            // Ждём весь TLS Client Hello: 5-байт header содержит длину
+                            val complete = isTlsRecordComplete(arr)
+                                || System.currentTimeMillis() > firstReadDeadline
+                                || firstChunk.size() > 8192
+                            if (complete) {
+                                TlsFragmenter.sendWithFragmentation(upstream, uout, arr)
+                                fragmented = true
+                            }
                         } else {
                             uout.write(buf, 0, n); uout.flush()
                         }
                     }
+                    // Если соединение закрылось до завершения сборки — шлём что есть
+                    if (!fragmented && firstChunk.size() > 0) {
+                        TlsFragmenter.sendWithFragmentation(upstream, uout, firstChunk.toByteArray())
+                    }
                 } catch (e: Exception) {
-                    // Только debug — connection-reset нормально при close
+                    // connection-reset нормально при close
                 } finally {
                     try { upstream.shutdownOutput() } catch (_: Exception) {}
                 }
@@ -170,6 +187,14 @@ class DpiSocksServer(private val port: Int) {
         } finally {
             try { client.close() } catch (_: Exception) {}
         }
+    }
+
+    /** Проверяем что собрали весь TLS record по полю length в header */
+    private fun isTlsRecordComplete(buf: ByteArray): Boolean {
+        if (buf.size < 5) return false
+        if (buf[0] != 0x16.toByte()) return true  // не TLS — не ждём
+        val recLen = ((buf[3].toInt() and 0xFF) shl 8) or (buf[4].toInt() and 0xFF)
+        return buf.size >= 5 + recLen
     }
 
     private fun reply(out: java.io.OutputStream, code: Int) {

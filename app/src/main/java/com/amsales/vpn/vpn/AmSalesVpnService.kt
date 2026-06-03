@@ -130,6 +130,14 @@ class AmSalesVpnService : VpnService() {
             val tmpDir = File(applicationContext.cacheDir, "sing-box").apply { mkdirs() }
             val stderrPath = File(applicationContext.filesDir, "stderr.log").absolutePath
 
+            // Чистим work-dir и tmp-dir от старого state — иначе sing-box
+            // может подхватить кеш DNS / соединений с предыдущего запуска
+            // и игнорировать новые DPI/route правила.
+            try {
+                workDir.listFiles()?.forEach { it.deleteRecursively() }
+                tmpDir.listFiles()?.forEach { it.deleteRecursively() }
+            } catch (_: Exception) {}
+
             stage("redirectStderr") {
                 try { Libbox.redirectStderr(stderrPath) }
                 catch (e: Throwable) { Log.w(TAG, "redirectStderr fail: ${e.message}") }
