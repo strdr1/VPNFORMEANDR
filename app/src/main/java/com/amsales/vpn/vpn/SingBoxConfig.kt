@@ -123,6 +123,22 @@ object SingBoxConfig {
                     .put("domain_suffix", dom)
                     .put("server", "local"))
             }
+            // DPI-сервисы должны резолвиться через local DNS — иначе IP-адрес
+            // youtube.com будет cloudflare-CDN из США через 1.1.1.1, и российский
+            // провайдер всё равно увидит "запрос к YouTube" и заблокирует
+            // независимо от того что мы делаем с TLS.
+            if (settings.useZapret) {
+                val dpiDomainsForDns = JSONArray()
+                for (id in settings.dpiServices) {
+                    val svc = com.amsales.vpn.data.DpiServices.byId(id) ?: continue
+                    for (d in svc.domains) dpiDomainsForDns.put(d)
+                }
+                if (dpiDomainsForDns.length() > 0) {
+                    dnsRules.put(JSONObject()
+                        .put("domain_suffix", dpiDomainsForDns)
+                        .put("server", "local"))
+                }
+            }
             if (dnsRules.length() > 0) put("rules", dnsRules)
             put("strategy", "prefer_ipv4")
             put("final", "remote")

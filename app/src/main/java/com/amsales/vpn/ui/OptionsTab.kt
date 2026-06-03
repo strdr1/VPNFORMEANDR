@@ -74,7 +74,8 @@ fun OptionsTab() {
         // .ru-трафик напрямую
         ToggleRow(
             title = "Российский трафик напрямую",
-            subtitle = ".ru-сайты идут мимо VPN",
+            subtitle = ".ru-сайты идут мимо VPN. РЕКОМЕНДУЕТСЯ — иначе " +
+                "российские сайты будут грузиться очень медленно или совсем не работать.",
             checked = routeRu
         ) {
             routeRu = it; repo.routeRuDirect = it
@@ -83,12 +84,25 @@ fun OptionsTab() {
 
         // Обход DPI — мастер-toggle + список сервисов
         var zapretOn by remember { mutableStateOf(repo.useZapret) }
+        var dpiSet by remember { mutableStateOf(repo.dpiServices) }
         ToggleRow(
             title = "Обход DPI (zapret)",
-            subtitle = "Главный переключатель. Когда выключен — список ниже игнорируется.",
+            subtitle = if (zapretOn && dpiSet.isEmpty())
+                "ВКЛЮЧЁН, но сервисы НЕ выбраны — отметь YouTube/Discord ниже"
+            else if (zapretOn)
+                "ВКЛЮЧЁН для ${dpiSet.size} сервис(ов). Переподключи VPN после изменений."
+            else
+                "ВЫКЛЮЧЕН. Сервисы ниже игнорируются.",
             checked = zapretOn
         ) {
-            zapretOn = it; repo.useZapret = it
+            zapretOn = it
+            repo.useZapret = it
+            // Auto-select YouTube при первом включении если список пуст
+            if (it && dpiSet.isEmpty()) {
+                val auto = setOf("youtube")
+                dpiSet = auto
+                repo.dpiServices = auto
+            }
         }
         Divider()
 
@@ -99,11 +113,11 @@ fun OptionsTab() {
         )
         Text(
             "Выбранные сервисы идут НАПРЯМУЮ с фрагментацией TLS — провайдер " +
-                "не видит SNI и не блокирует. Реклама региональная (российский IP).",
+                "не видит SNI и не блокирует. Реклама региональная (российский IP).\n" +
+                "ВАЖНО: после изменений нужно переподключить VPN.",
             color = AmTextLo, fontSize = 11.sp
         )
         Spacer(Modifier.height(8.dp))
-        var dpiSet by remember { mutableStateOf(repo.dpiServices) }
         com.amsales.vpn.data.DpiServices.ALL.forEach { svc ->
             val checked = svc.id in dpiSet
             Row(
