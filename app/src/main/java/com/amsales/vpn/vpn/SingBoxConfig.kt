@@ -199,7 +199,13 @@ object SingBoxConfig {
             // Без override_android_vpn sing-box НЕ принимает наш VpnService
             // как upstream — и трафик никуда не идёт, хотя ошибок нет.
             put("auto_detect_interface", true)
-            put("override_android_vpn", true)
+            // НЕ override_android_vpn — это бы заставило sing-box
+            // выбирать VPN-таблицу как upstream, а у нас VPN-таблица —
+            // это НАШ ЖЕ TUN (loop, трафик никуда не идёт).
+            // sing-tun/monitor_android.go: если override=true берёт
+            // rule.Mask==0x20000 (VPN-таблица); если false — пропускает
+            // VPN-rule и идёт на rule.Mask==0xFFFF (физическая wlan0/rmnet).
+            put("override_android_vpn", false)
         }
 
         val direct = JSONObject().apply {
