@@ -90,6 +90,12 @@ class Repository(private val context: Context) {
         get() = context.prefs().getBoolean("use_zapret", false)
         set(v) { context.prefs().edit().putBoolean("use_zapret", v).apply() }
 
+    /** Какие сервисы пропускать через DPI-обход (фрагментация TLS).
+     *  Доступные значения см. в DpiServices.kt */
+    var dpiServices: Set<String>
+        get() = context.prefs().getStringSet("dpi_services", emptySet()) ?: emptySet()
+        set(v) { context.prefs().edit().putStringSet("dpi_services", v.toHashSet()).apply() }
+
     var tgProxyLink: String
         get() = context.prefs().getString("tg_proxy_link", "") ?: ""
         set(v) { context.prefs().edit().putString("tg_proxy_link", v).apply() }

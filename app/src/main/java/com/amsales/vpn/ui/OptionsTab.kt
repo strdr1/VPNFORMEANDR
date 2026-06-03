@@ -49,7 +49,6 @@ fun OptionsTab() {
     val repo = LocalRepository.current
     val ctx = LocalContext.current
     var routeRu by remember { mutableStateOf(repo.routeRuDirect) }
-    var useZapret by remember { mutableStateOf(repo.useZapret) }
     var autoBoot by remember { mutableStateOf(repo.autoConnectOnBoot) }
     var bypassSites by remember { mutableStateOf(repo.bypassSites) }
     var newSite by remember { mutableStateOf("") }
@@ -82,13 +81,48 @@ fun OptionsTab() {
         }
         Divider()
 
-        // Обход DPI (zapret)
-        ToggleRow(
-            title = "Обход DPI (zapret)",
-            subtitle = "Маскирует TLS-handshake для трафика, идущего мимо VPN",
-            checked = useZapret
-        ) {
-            useZapret = it; repo.useZapret = it
+        // Обход DPI — выбор сервисов
+        Spacer(Modifier.height(12.dp))
+        Text(
+            "Обход DPI (без VPN)",
+            color = AmTextHi, fontSize = 14.sp, fontWeight = FontWeight.Medium
+        )
+        Text(
+            "Выбранные сервисы идут НАПРЯМУЮ с фрагментацией TLS — провайдер " +
+                "не видит SNI и не блокирует. Скорость как у обычного интернета, " +
+                "реклама региональная (можно блокировщиком).",
+            color = AmTextLo, fontSize = 11.sp
+        )
+        Spacer(Modifier.height(8.dp))
+        var dpiSet by remember { mutableStateOf(repo.dpiServices) }
+        com.amsales.vpn.data.DpiServices.ALL.forEach { svc ->
+            val checked = svc.id in dpiSet
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        val next = if (checked) dpiSet - svc.id else dpiSet + svc.id
+                        dpiSet = next
+                        repo.dpiServices = next
+                    }
+                    .padding(vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(svc.title, color = AmTextHi, fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium)
+                    Text(svc.description, color = AmTextLo, fontSize = 10.sp)
+                }
+                Checkbox(
+                    checked = checked,
+                    onCheckedChange = null,
+                    colors = CheckboxDefaults.colors(
+                        checkedColor = AmAccent,
+                        uncheckedColor = AmTextLo,
+                        checkmarkColor = AmBgTop,
+                    )
+                )
+            }
         }
         Divider()
 

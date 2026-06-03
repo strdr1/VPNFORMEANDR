@@ -134,6 +134,11 @@ object SingBoxConfig {
         rules.put(JSONObject()
             .put("protocol", "dns")
             .put("action", "hijack-dns"))
+        // localhost (наш DPI-прокси) — direct, чтобы не зациклиться через VPN
+        rules.put(JSONObject()
+            .put("ip_cidr", JSONArray().put("127.0.0.0/8"))
+            .put("action", "route")
+            .put("outbound", "direct"))
         // Exclude самого VPN-сервера. key.host может быть IP (45.92...)
         // или доменом (для CF-Worker'а: amsales-vpn.danecc5678.workers.dev).
         // ip_cidr принимает только IP — для домена используем domain.
@@ -165,6 +170,23 @@ object SingBoxConfig {
                 .put("outbound", "direct"))
         }
 
+        // DPI-обход: выбранные пользователем сервисы (YouTube/Discord/etc)
+        // идут НЕ через VPN и НЕ через direct, а через наш локальный
+        // SOCKS5-прокси который фрагментирует TLS Client Hello.
+        val dpiDomains = JSONArray()
+        for (id in settings.dpiServices) {
+            val svc = com.amsales.vpn.data.DpiServices.byId(id) ?: continue
+            for (d in svc.domains) dpiDomains.put(d)
+        }
+        if (dpiDomains.length() > 0) {
+            rules.put(JSONObject()
+                .put("domain_suffix", dpiDomains)
+                .put("action", "route")
+                .put("outbound", "dpi-bypass"))
+            // IP-сервера VPN не должны ходить через DPI-обход
+            // (защита от случайного коллапса)
+        }
+
         val route = JSONObject().apply {
             put("rules", rules)
             put("final", "proxy")
@@ -182,6 +204,18 @@ object SingBoxConfig {
             put("tag", "direct")
         }
 
+        // SOCKS5 outbound на наш локальный DPI-фрагментирующий прокси.
+        // Включаем только если есть выбранные DPI-сервисы.
+        val dpiBypass = if (settings.dpiServices.isNotEmpty()) {
+            JSONObject().apply {
+                put("type", "socks")
+                put("tag", "dpi-bypass")
+                put("server", "127.0.0.1")
+                put("server_port", AmSalesVpnService.DPI_PORT)
+                put("version", "5")
+            }
+        } else null
+
         val root = JSONObject().apply {
             // info-уровень — увидим в логе попытки подключения к VLESS,
             // DNS-разрешение, ошибки REALITY-handshake.
@@ -191,9 +225,11 @@ object SingBoxConfig {
                 .put("timestamp", true))
             put("dns", dns)
             put("inbounds", JSONArray().put(tun))
-            put("outbounds", JSONArray()
+            val obs = JSONArray()
                 .put(vless)
-                .put(direct))
+                .put(direct)
+            if (dpiBypass != null) obs.put(dpiBypass)
+            put("outbounds", obs)
             put("route", route)
         }
 

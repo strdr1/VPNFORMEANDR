@@ -54,6 +54,7 @@ class AmSalesVpnService : VpnService() {
         const val ACTION_DISCONNECT = "com.amsales.vpn.DISCONNECT"
         const val TUN_ADDRESS = "172.19.0.1"
         const val TUN_MTU = 1500
+        const val DPI_PORT = 8443  // локальный SOCKS5 для DPI-обхода
         private const val TAG = "AmSalesVpnService"
         private const val NOTIF_CHANNEL = "amsales_vpn_channel"
         private const val NOTIF_ID = 1
@@ -65,6 +66,7 @@ class AmSalesVpnService : VpnService() {
     private val starting = AtomicBoolean(false)
     private var commandServer: CommandServer? = null
     private var platformInterface: AmSalesPlatformInterface? = null
+    private var dpiServer: com.amsales.vpn.dpi.DpiSocksServer? = null
     private var statsJob: Job? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var currentTag: String = ""
@@ -173,7 +175,18 @@ class AmSalesVpnService : VpnService() {
             }
             commandServer = server
 
-            // 4. собираем JSON-конфиг
+            // 4. Если есть DPI-сервисы — поднимаем локальный TLS-фрагментирующий
+            // SOCKS5-прокси на 127.0.0.1:DPI_PORT. sing-box будет ходить через
+            // него для youtube/spotify/etc.
+            if (repo.dpiServices.isNotEmpty()) {
+                stage("DPI SOCKS server start") {
+                    val ds = com.amsales.vpn.dpi.DpiSocksServer(DPI_PORT)
+                    ds.start()
+                    dpiServer = ds
+                }
+            }
+
+            // 5. собираем JSON-конфиг
             val json = SingBoxConfig.build(key, repo, TUN_MTU)
             Log.d(TAG, "sing-box config:\n$json")
 
@@ -251,6 +264,8 @@ class AmSalesVpnService : VpnService() {
     }
 
     private fun cleanup() {
+        try { dpiServer?.stop() } catch (_: Exception) {}
+        dpiServer = null
         try { commandServer?.closeService() } catch (e: Exception) { Log.w(TAG, "closeService: ${e.message}") }
         // Не закрываем тут tunFd сразу — sing-box дюпает fd на Go-side,
         // и его горутины могут ещё использовать наш fd 500ms-1s после
