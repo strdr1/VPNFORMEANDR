@@ -133,6 +133,7 @@ private fun VpnTab(state: com.amsales.vpn.vpn.VpnUiState, onToggle: () -> Unit) 
     val activeName = profiles.getOrNull(currentIdx)?.name ?: "—"
     val connected = state.isOn
     val connecting = state.isConnecting
+    var mode by remember { mutableStateOf(repo.vpnMode) }
 
     Column(
         modifier = Modifier.fillMaxSize().padding(top = 32.dp),
@@ -168,7 +169,31 @@ private fun VpnTab(state: com.amsales.vpn.vpn.VpnUiState, onToggle: () -> Unit) 
             }
         )
 
-        Spacer(Modifier.height(36.dp))
+        Spacer(Modifier.height(16.dp))
+
+        // Переключатель режима: VPN (полный туннель) / DPI (только обход без VPN)
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(20.dp))
+                .background(AmBgTop)
+                .padding(4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            ModeChip(
+                label = "VPN",
+                selected = mode == "vpn",
+                enabled = !connected && !connecting,
+                onClick = { mode = "vpn"; repo.vpnMode = "vpn" }
+            )
+            ModeChip(
+                label = "Zapret",
+                selected = mode == "dpi",
+                enabled = !connected && !connecting,
+                onClick = { mode = "dpi"; repo.vpnMode = "dpi" }
+            )
+        }
+
+        Spacer(Modifier.height(20.dp))
 
         PowerButton(connected = connected, connecting = connecting, onClick = onToggle)
 
@@ -447,6 +472,28 @@ fun AboutTab() {
         Text(
             stringResource(R.string.about_desc),
             color = AmTextLo, fontSize = 12.sp, textAlign = TextAlign.Center
+        )
+    }
+}
+
+@Composable
+private fun ModeChip(label: String, selected: Boolean, enabled: Boolean, onClick: () -> Unit) {
+    val bg = if (selected) AmAccent else androidx.compose.ui.graphics.Color.Transparent
+    val fg = if (selected) AmBgTop else AmTextLo
+    Surface(
+        color = bg,
+        shape = RoundedCornerShape(16.dp),
+        modifier = Modifier
+            .padding(horizontal = 2.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .let { if (enabled) it.clickable { onClick() } else it }
+    ) {
+        Text(
+            label,
+            color = fg,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
         )
     }
 }

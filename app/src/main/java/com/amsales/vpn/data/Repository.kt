@@ -93,6 +93,16 @@ class Repository(private val context: Context) {
         get() = context.prefs().getBoolean("use_zapret", true)
         set(v) { context.prefs().edit().putBoolean("use_zapret", v).apply() }
 
+    /** Режим работы кнопки на главном экране:
+     *   "vpn"  — полный VLESS-туннель + DPI + ad-block (как раньше)
+     *   "dpi"  — только DPI-обход и блокировка рекламы (без VPN).
+     *            Трафик идёт direct с российского IP, но YouTube без блокировок.
+     *            Не нужен заграничный сервер.
+     */
+    var vpnMode: String
+        get() = context.prefs().getString("vpn_mode", "vpn") ?: "vpn"
+        set(v) { context.prefs().edit().putString("vpn_mode", v).apply() }
+
     /** Какие сервисы пропускать через DPI-обход (фрагментация TLS).
      *  Доступные значения см. в DpiServices.kt */
     var dpiServices: Set<String>

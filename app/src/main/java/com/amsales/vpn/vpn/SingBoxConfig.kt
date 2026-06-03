@@ -21,6 +21,118 @@ import org.json.JSONObject
  */
 object SingBoxConfig {
 
+    /** YouTube/Google ads-домены — блокируем reject'ом в обоих режимах. */
+    private val AD_DOMAINS = listOf(
+        "googleads.g.doubleclick.net",
+        "pagead2.googlesyndication.com",
+        "pagead.googlesyndication.com",
+        "googlesyndication.com",
+        "doubleclick.net",
+        "googleadservices.com",
+        "google-analytics.com",
+        "googletagmanager.com",
+        "googletagservices.com",
+        "static.doubleclick.net",
+        "ads.youtube.com",
+        // Внутренний YouTube endpoint для рекламы
+        "youtubei.googleapis.com/youtube/v1/log_event",
+    )
+
+    /**
+     * DPI-only режим: VPN-туннель БЕЗ VLESS-прокси.
+     * Весь трафик идёт direct, но DPI-сервисы перехватываются и проходят
+     * через локальный TLS-фрагментирующий SOCKS5. Рекламные домены
+     * блокируются.
+     */
+    fun buildDpiOnly(settings: Repository, tunMtu: Int): String {
+        // Inbound TUN
+        val tun = JSONObject().apply {
+            put("type", "tun")
+            put("tag", "tun-in")
+            put("address", JSONArray().put("${AmSalesVpnService.TUN_ADDRESS}/30"))
+            put("mtu", tunMtu)
+            put("auto_route", true)
+            put("strict_route", false)
+            put("stack", "mixed")
+        }
+
+        // DNS — простой: системный UDP 8.8.8.8.
+        val dns = JSONObject().apply {
+            put("servers", JSONArray()
+                .put(JSONObject()
+                    .put("tag", "local")
+                    .put("type", "udp")
+                    .put("server", "8.8.8.8")))
+            put("strategy", "prefer_ipv4")
+            put("final", "local")
+        }
+
+        // Outbounds
+        val direct = JSONObject().apply {
+            put("type", "direct"); put("tag", "direct")
+        }
+        val block = JSONObject().apply {
+            put("type", "block"); put("tag", "block")
+        }
+        val dpiBypass = if (settings.dpiServices.isNotEmpty()) {
+            JSONObject().apply {
+                put("type", "socks"); put("tag", "dpi-bypass")
+                put("server", "127.0.0.1")
+                put("server_port", AmSalesVpnService.DPI_PORT)
+                put("version", "5")
+            }
+        } else null
+
+        // Route rules
+        val rules = JSONArray()
+        rules.put(JSONObject().put("action", "sniff"))
+        rules.put(JSONObject().put("protocol", "dns").put("action", "hijack-dns"))
+        rules.put(JSONObject()
+            .put("ip_cidr", JSONArray().put("127.0.0.0/8"))
+            .put("action", "route").put("outbound", "direct"))
+
+        // Блокировка рекламы (Google ads)
+        val adJson = JSONArray()
+        AD_DOMAINS.forEach { adJson.put(it) }
+        rules.put(JSONObject()
+            .put("domain_suffix", adJson)
+            .put("action", "route").put("outbound", "block"))
+
+        // DPI-обход
+        if (dpiBypass != null) {
+            val dpiDomains = JSONArray()
+            for (id in settings.dpiServices) {
+                val svc = com.amsales.vpn.data.DpiServices.byId(id) ?: continue
+                for (d in svc.domains) dpiDomains.put(d)
+            }
+            if (dpiDomains.length() > 0) {
+                rules.put(JSONObject()
+                    .put("domain_suffix", dpiDomains)
+                    .put("action", "route").put("outbound", "dpi-bypass"))
+            }
+        }
+
+        val route = JSONObject().apply {
+            put("rules", rules)
+            put("final", "direct")  // ← главное отличие от полного VPN
+            put("auto_detect_interface", true)
+            put("override_android_vpn", false)
+        }
+
+        val obs = JSONArray().put(direct).put(block)
+        if (dpiBypass != null) obs.put(dpiBypass)
+
+        val root = JSONObject().apply {
+            put("log", JSONObject()
+                .put("level", "warn").put("output", "stderr").put("timestamp", true))
+            put("dns", dns)
+            put("inbounds", JSONArray().put(tun))
+            put("outbounds", obs)
+            put("route", route)
+        }
+        return root.toString(2)
+    }
+
     fun build(key: VlessKey, settings: Repository, tunMtu: Int): String {
 
         // Outbound vless
@@ -155,6 +267,13 @@ object SingBoxConfig {
             .put("ip_cidr", JSONArray().put("127.0.0.0/8"))
             .put("action", "route")
             .put("outbound", "direct"))
+        // Блокировка рекламы YouTube/Google (доменный reject)
+        val adJson = JSONArray()
+        AD_DOMAINS.forEach { adJson.put(it) }
+        rules.put(JSONObject()
+            .put("domain_suffix", adJson)
+            .put("action", "route")
+            .put("outbound", "block"))
         // Exclude самого VPN-сервера. key.host может быть IP (45.92...)
         // или доменом (для CF-Worker'а: amsales-vpn.danecc5678.workers.dev).
         // ip_cidr принимает только IP — для домена используем domain.
@@ -224,6 +343,10 @@ object SingBoxConfig {
             put("type", "direct")
             put("tag", "direct")
         }
+        val block = JSONObject().apply {
+            put("type", "block")
+            put("tag", "block")
+        }
 
         // SOCKS5 outbound на наш локальный DPI-фрагментирующий прокси.
         // Включаем только если есть выбранные DPI-сервисы и включён zapret.
@@ -249,6 +372,7 @@ object SingBoxConfig {
             val obs = JSONArray()
                 .put(vless)
                 .put(direct)
+                .put(block)
             if (dpiBypass != null) obs.put(dpiBypass)
             put("outbounds", obs)
             put("route", route)

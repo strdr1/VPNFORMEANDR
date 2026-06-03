@@ -52,6 +52,7 @@ class AmSalesVpnService : VpnService() {
     companion object {
         const val ACTION_CONNECT = "com.amsales.vpn.CONNECT"
         const val ACTION_DISCONNECT = "com.amsales.vpn.DISCONNECT"
+        const val ACTION_SWITCH_MODE = "com.amsales.vpn.SWITCH_MODE"
         const val TUN_ADDRESS = "172.19.0.1"
         const val TUN_MTU = 1500
         const val DPI_PORT = 8443  // локальный SOCKS5 для DPI-обхода
@@ -77,6 +78,14 @@ class AmSalesVpnService : VpnService() {
         when (intent?.action) {
             ACTION_CONNECT -> scope.launch { connect() }
             ACTION_DISCONNECT -> scope.launch { disconnect() }
+            ACTION_SWITCH_MODE -> scope.launch {
+                // Переключаем режим в настройках и перезапускаем сервис
+                val repo = Repository(applicationContext)
+                repo.vpnMode = if (repo.vpnMode == "vpn") "dpi" else "vpn"
+                disconnect()
+                kotlinx.coroutines.delay(300)
+                connect()
+            }
         }
         return START_STICKY
     }
@@ -115,13 +124,19 @@ class AmSalesVpnService : VpnService() {
 
         try {
             val repo = Repository(applicationContext)
-            val key = repo.current()?.key ?: run {
-                VpnState.broadcast(applicationContext, "error",
-                    error = "Сначала добавьте ключ на вкладке Серверы")
-                stopSelf()
-                return
+            val isDpiOnly = repo.vpnMode == "dpi"
+
+            val key = if (isDpiOnly) {
+                null  // DPI-only режим не требует VLESS-ключа
+            } else {
+                repo.current()?.key ?: run {
+                    VpnState.broadcast(applicationContext, "error",
+                        error = "Сначала добавьте ключ на вкладке Серверы")
+                    stopSelf()
+                    return
+                }
             }
-            currentTag = key.tag
+            currentTag = if (isDpiOnly) "DPI-обход" else (key?.tag ?: "?")
             VpnState.broadcast(applicationContext, "connecting", tag = currentTag)
 
             // 1. перенаправляем Go-stderr в файл (для Go-паник)
@@ -194,9 +209,10 @@ class AmSalesVpnService : VpnService() {
             }
             commandServer = server
 
-            // 4. Если есть DPI-сервисы И включён мастер-toggle — поднимаем
+            // 4. Если есть DPI-сервисы (или DPI-only режим) — поднимаем
             // локальный TLS-фрагментирующий SOCKS5-прокси.
-            if (repo.useZapret && repo.dpiServices.isNotEmpty()) {
+            val needDpi = (isDpiOnly || repo.useZapret) && repo.dpiServices.isNotEmpty()
+            if (needDpi) {
                 stage("DPI SOCKS server start") {
                     val ds = com.amsales.vpn.dpi.DpiSocksServer(DPI_PORT)
                     ds.start()
@@ -204,9 +220,13 @@ class AmSalesVpnService : VpnService() {
                 }
             }
 
-            // 5. собираем JSON-конфиг
-            val json = SingBoxConfig.build(key, repo, TUN_MTU)
-            Log.d(TAG, "sing-box config:\n$json")
+            // 5. собираем JSON-конфиг — VPN или DPI-only
+            val json = if (isDpiOnly) {
+                SingBoxConfig.buildDpiOnly(repo, TUN_MTU)
+            } else {
+                SingBoxConfig.build(key!!, repo, TUN_MTU)
+            }
+            Log.d(TAG, "sing-box config (mode=${if (isDpiOnly) "DPI" else "VPN"}):\n$json")
 
             stage("Libbox.checkConfig") {
                 Libbox.checkConfig(json)
@@ -345,12 +365,22 @@ class AmSalesVpnService : VpnService() {
             Intent(this, AmSalesVpnService::class.java).setAction(ACTION_DISCONNECT),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+        val switchPI = PendingIntent.getService(
+            this, 2,
+            Intent(this, AmSalesVpnService::class.java).setAction(ACTION_SWITCH_MODE),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val repo = Repository(applicationContext)
+        val modeLabel = if (repo.vpnMode == "dpi") "Zapret" else "VPN"
+        val switchLabel = if (repo.vpnMode == "dpi") "Включить VPN" else "Zapret"
 
         return NotificationCompat.Builder(this, NOTIF_CHANNEL)
             .setSmallIcon(android.R.drawable.ic_lock_lock)
-            .setContentTitle(getString(R.string.notif_title))
+            .setContentTitle("AM.SALES $modeLabel активен")
             .setContentText(getString(R.string.notif_text, tag))
             .setContentIntent(openPI)
+            .addAction(0, switchLabel, switchPI)
             .addAction(0, getString(R.string.notif_disconnect), disconnectPI)
             .setOngoing(true)
             .build()
