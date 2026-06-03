@@ -193,18 +193,14 @@ object SingBoxConfig {
         val route = JSONObject().apply {
             put("rules", rules)
             put("final", "proxy")
-            // auto_detect_interface на Android по официальной доке
-            // ("supported on Linux/Windows/macOS, NOT Android")
-            // работает только в паре с override_android_vpn=true.
-            // Без override_android_vpn sing-box НЕ принимает наш VpnService
-            // как upstream — и трафик никуда не идёт, хотя ошибок нет.
+            // sing-box должен сам определить физический интерфейс (wlan0/rmnet)
+            // и использовать его как upstream для своих outbound-сокетов.
             put("auto_detect_interface", true)
-            // НЕ override_android_vpn — это бы заставило sing-box
-            // выбирать VPN-таблицу как upstream, а у нас VPN-таблица —
-            // это НАШ ЖЕ TUN (loop, трафик никуда не идёт).
-            // sing-tun/monitor_android.go: если override=true берёт
-            // rule.Mask==0x20000 (VPN-таблица); если false — пропускает
-            // VPN-rule и идёт на rule.Mask==0xFFFF (физическая wlan0/rmnet).
+            // КРИТИЧНО false: когда sing-box САМ работает как Android-VPN
+            // (через наш AmSalesVpnService), VPN-таблица в ядре указывает
+            // на НАШ ЖЕ TUN. Если override=true — sing-box выберет VPN-таблицу
+            // и трафик зациклится в TUN. false → sing-box идёт на rule.Mask=0xFFFF
+            // = физический wlan0/rmnet (sing-tun/monitor_android.go).
             put("override_android_vpn", false)
         }
 
