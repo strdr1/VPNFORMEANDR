@@ -77,7 +77,10 @@ object SingBoxConfig {
             put("mtu", tunMtu)
             put("auto_route", true)        // важнo: триггерит вызов platform.openTun()
             put("strict_route", false)
-            put("stack", "gvisor")
+            // mixed = system TCP + gvisor UDP. system-стек надёжнее на
+            // Android чем gvisor — он не паникует в случае race conditions.
+            // gvisor крашился: github.com/sagernet/sing-tun/stack_gvisor_tcp.go:94
+            put("stack", "mixed")
         }
 
         // DNS — два сервера:
@@ -162,10 +165,6 @@ object SingBoxConfig {
             // как upstream — и трафик никуда не идёт, хотя ошибок нет.
             put("auto_detect_interface", true)
             put("override_android_vpn", true)
-            // НЕ зовём findConnectionOwner если нет правил с process_name —
-            // на Android 13 у нас Build.VERSION >= Q, но всё равно лишний
-            // round-trip через JNI на каждом пакете.
-            put("find_process", false)
         }
 
         val direct = JSONObject().apply {

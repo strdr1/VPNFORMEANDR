@@ -11,7 +11,6 @@ import android.os.Process
 import android.util.Log
 import androidx.annotation.RequiresApi
 import io.nekohasekai.libbox.ConnectionOwner
-import io.nekohasekai.libbox.ExchangeContext
 import io.nekohasekai.libbox.InterfaceUpdateListener
 import io.nekohasekai.libbox.LocalDNSTransport
 import io.nekohasekai.libbox.NetworkInterface
@@ -144,40 +143,11 @@ class AmSalesPlatformInterface(
     override fun clearDNSCache() {}
     override fun readWIFIState(): WIFIState? = null
 
-    // Минимальный LocalDNSTransport — без него Go-сторона sing-box на
-    // Android может крашиться SIGABRT при попытке резолва .ru-доменов
-    // через local-сервер. Используем InetAddress.getAllByName (он сам
-    // ходит через системный DNS поверх default network).
-    override fun localDNSTransport(): LocalDNSTransport? = SimpleLocalDNS()
-
-    private class SimpleLocalDNS : LocalDNSTransport {
-        override fun raw(): Boolean = false  // мы не raw, мы по lookup-методу
-
-        override fun exchange(ctx: ExchangeContext, message: ByteArray) {
-            // raw()=false => этот метод не должен зваться, но на всякий случай.
-            ctx.errorCode(2)  // SERVFAIL
-        }
-
-        override fun lookup(ctx: ExchangeContext, network: String, domain: String) {
-            try {
-                val addrs = java.net.InetAddress.getAllByName(domain)
-                val filtered = addrs.filter {
-                    when (network) {
-                        "ip4", "tcp4", "udp4" -> it is java.net.Inet4Address
-                        "ip6", "tcp6", "udp6" -> it is java.net.Inet6Address
-                        else -> true
-                    }
-                }
-                if (filtered.isEmpty()) {
-                    ctx.errorCode(3)  // NXDOMAIN
-                    return
-                }
-                ctx.success(filtered.joinToString(" ") { it.hostAddress ?: "" })
-            } catch (e: Exception) {
-                ctx.errorCode(2)  // SERVFAIL
-            }
-        }
-    }
+    // localDNSTransport=null — на стороне Go это значит "используйте свой
+    // dns-сервер из конфига" (например наш local-сервер 8.8.8.8 через udp).
+    // Реализация через JNI/InetAddress.getAllByName рискованна — её
+    // ExchangeContext.errorCode/success могут запаниковать в нативке.
+    override fun localDNSTransport(): LocalDNSTransport? = null
 
     // Возвращаем пустой StringIterator (не null!) — Go-сторона может
     // делать .Next() на nil и крашиться.

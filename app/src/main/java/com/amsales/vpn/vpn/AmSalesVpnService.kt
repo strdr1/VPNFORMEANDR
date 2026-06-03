@@ -246,11 +246,20 @@ class AmSalesVpnService : VpnService() {
 
     private fun cleanup() {
         try { commandServer?.closeService() } catch (e: Exception) { Log.w(TAG, "closeService: ${e.message}") }
+        // Не закрываем тут tunFd сразу — sing-box дюпает fd на Go-side,
+        // и его горутины могут ещё использовать наш fd 500ms-1s после
+        // closeService(). Закроем чуть позже.
+        val pfd = platformInterface?.tunFd
         try { commandServer?.close() } catch (e: Exception) { Log.w(TAG, "server.close: ${e.message}") }
         commandServer = null
-
-        try { platformInterface?.tunFd?.close() } catch (_: Exception) {}
         platformInterface = null
+
+        if (pfd != null) {
+            scope.launch {
+                kotlinx.coroutines.delay(1000)
+                try { pfd.close() } catch (_: Exception) {}
+            }
+        }
     }
 
     private fun buildNotification(tag: String): Notification {
