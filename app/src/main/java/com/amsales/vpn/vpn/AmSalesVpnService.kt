@@ -32,9 +32,8 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.io.File
-import java.net.HttpURLConnection
-import java.net.Proxy
-import java.net.URL
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -364,29 +363,51 @@ class AmSalesVpnService : VpnService() {
     // запущен» ещё не значит «трафик идёт». Делаем настоящий HTTP-запрос
     // через outbound "proxy" (clash API delay). В «Авто» первая попытка
     // сначала перемеряет всю группу, чтобы urltest ушёл с мёртвого сервера.
-    // 3 неудачи подряд → отключаемся с ошибкой, чтобы вернуть интернет.
+    // 3 честных «трафик не идёт» подряд → отключаемся с ошибкой, чтобы
+    // вернуть интернет. Если же сама проверка не смогла достучаться до
+    // clash API — туннель не трогаем: неизвестно ≠ не работает.
 
-    private fun clashGet(path: String, timeoutMs: Int): String? = try {
-        val conn = URL("http://127.0.0.1:${SingBoxConfig.CLASH_API_PORT}$path")
-            .openConnection(Proxy.NO_PROXY) as HttpURLConnection
-        conn.connectTimeout = 3000
-        conn.readTimeout = timeoutMs
-        try {
-            if (conn.responseCode == 200) conn.inputStream.bufferedReader().readText() else null
-        } finally {
-            conn.disconnect()
+    private class ClashResp(val code: Int, val body: String)
+
+    /**
+     * GET к clash API через голый сокет, HTTP/1.0 (сервер закрывает
+     * соединение после ответа). Не HttpURLConnection: при targetSdk 28+
+     * Android запрещает cleartext HTTP, и запрос к http://127.0.0.1 падал
+     * ещё до отправки — проверка считала туннель мёртвым и рвала его.
+     * null — API недоступен (не знаем, есть ли трафик).
+     */
+    private fun clashGet(path: String, timeoutMs: Int): ClashResp? = try {
+        Socket().use { s ->
+            s.connect(InetSocketAddress("127.0.0.1", SingBoxConfig.CLASH_API_PORT), 3000)
+            s.soTimeout = timeoutMs
+            s.getOutputStream().write(
+                "GET $path HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n".toByteArray(Charsets.US_ASCII))
+            val resp = s.getInputStream().readBytes().toString(Charsets.UTF_8)
+            val code = resp.substringAfter(' ', "").take(3).toIntOrNull() ?: return@use null
+            ClashResp(code, resp.substringAfter("\r\n\r\n", ""))
         }
     } catch (_: Exception) {
         null
     }
 
+    /** >0 — задержка в мс; 0 — API ответил, что трафик не прошёл;
+     *  -1 — API недоступен (результат неизвестен). */
     private fun proxyDelay(groupTest: Boolean): Int {
         val q = "?url=" + URLEncoder.encode(SingBoxConfig.TEST_URL, "UTF-8") + "&timeout=6000"
         // Ответ группы не показателен (пока идёт её собственная проверка,
         // sing-box отдаёт {}), решение — по delay самого "proxy".
         if (groupTest) clashGet("/group/proxy/delay$q", 15_000)
-        val body = clashGet("/proxies/proxy/delay$q", 9_000) ?: return 0
-        return try { JSONObject(body).optInt("delay", 0) } catch (_: Exception) { 0 }
+        var unreachable = true
+        // Второй адрес — на случай, если первый недоступен именно через этот сервер.
+        for (url in listOf(SingBoxConfig.TEST_URL, "http://cp.cloudflare.com/generate_204")) {
+            val qs = "?url=" + URLEncoder.encode(url, "UTF-8") + "&timeout=6000"
+            val r = clashGet("/proxies/proxy/delay$qs", 9_000) ?: continue
+            unreachable = false
+            if (r.code != 200) continue
+            val d = try { JSONObject(r.body).optInt("delay", 0) } catch (_: Exception) { 0 }
+            if (d > 0) return d
+        }
+        return if (unreachable) -1 else 0
     }
 
     /** Какой сервер сейчас несёт трафик (для «Авто» — выбор urltest). */
@@ -396,7 +417,7 @@ class AmSalesVpnService : VpnService() {
             servers.firstOrNull()?.tag
         } else {
             val now = clashGet("/proxies/proxy", 4000)?.let {
-                try { JSONObject(it).optString("now") } catch (_: Exception) { "" }
+                try { JSONObject(it.body).optString("now") } catch (_: Exception) { "" }
             }.orEmpty()
             now.removePrefix("s").toIntOrNull()?.let { servers.getOrNull(it)?.tag }
         } ?: return
@@ -409,9 +430,15 @@ class AmSalesVpnService : VpnService() {
         checkJob?.cancel()
         checkJob = scope.launch {
             delay(2500)
+            var failures = 0
             for (attempt in 0 until 3) {
                 if (!isRunning) return@launch
                 val d = proxyDelay(groupTest = activeServers.size > 1 && attempt == 0)
+                if (d < 0) {
+                    Log.w(TAG, "tunnel check: clash API unreachable, attempt $attempt")
+                } else if (d == 0) {
+                    failures++
+                }
                 if (d > 0) {
                     Log.i(TAG, "tunnel check OK: ${d}ms")
                     refreshActiveTag(isHybrid)
@@ -426,6 +453,11 @@ class AmSalesVpnService : VpnService() {
                 delay(2000)
             }
             if (!isRunning) return@launch
+            // Рвём туннель, только если API трижды ответил «трафик не прошёл».
+            if (failures < 3) {
+                Log.w(TAG, "tunnel check inconclusive ($failures failures) — keeping tunnel")
+                return@launch
+            }
             val many = activeServers.size > 1
             Log.w(TAG, "tunnel check failed — disconnecting")
             disconnect()
