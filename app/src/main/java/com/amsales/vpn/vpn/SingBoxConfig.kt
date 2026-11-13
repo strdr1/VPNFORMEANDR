@@ -44,7 +44,7 @@ object SingBoxConfig {
      * через локальный TLS-фрагментирующий SOCKS5. Рекламные домены
      * блокируются.
      */
-    fun buildDpiOnly(settings: Repository, tunMtu: Int): String {
+    fun buildDpiOnly(settings: Repository, tunMtu: Int, logPath: String = ""): String {
         // Inbound TUN
         val tun = JSONObject().apply {
             put("type", "tun")
@@ -78,6 +78,9 @@ object SingBoxConfig {
                 put("server", "127.0.0.1")
                 put("server_port", AmSalesVpnService.DPI_PORT)
                 put("version", "5")
+                // ВАЖНО: TCP only — наш DpiSocksServer не умеет UDP.
+                // YouTube/QUIC (UDP 443) уйдёт на direct fallback.
+                put("network", "tcp")
             }
         } else null
 
@@ -88,6 +91,8 @@ object SingBoxConfig {
         rules.put(JSONObject()
             .put("ip_cidr", JSONArray().put("127.0.0.0/8"))
             .put("action", "route").put("outbound", "direct"))
+        // (наш UID исключён из TUN через addDisallowedApplication,
+        //  правило package_name не нужно)
 
         // Блокировка рекламы (Google ads) — action: reject (sing-box 1.13+)
         val adJson = JSONArray()
@@ -104,6 +109,16 @@ object SingBoxConfig {
                 for (d in svc.domains) dpiDomains.put(d)
             }
             if (dpiDomains.length() > 0) {
+                // QUIC (UDP 443) → пускаем direct, но БЕЗ фрагментации.
+                // Провайдер РКН SNI-блок видит QUIC ClientHello, рвёт.
+                // YouTube видит "QUIC fails" → fallback на TCP → наш SOCKS.
+                // Вариант с reject silent-drop'ом — YouTube ретраил бесконечно.
+                rules.put(JSONObject()
+                    .put("domain_suffix", dpiDomains)
+                    .put("network", "udp")
+                    .put("port", 443)
+                    .put("action", "route").put("outbound", "direct"))
+                // TCP — в наш DPI-bypass SOCKS
                 rules.put(JSONObject()
                     .put("domain_suffix", dpiDomains)
                     .put("action", "route").put("outbound", "dpi-bypass"))
@@ -121,8 +136,9 @@ object SingBoxConfig {
         if (dpiBypass != null) obs.put(dpiBypass)
 
         val root = JSONObject().apply {
-            put("log", JSONObject()
-                .put("level", "debug").put("output", "stderr").put("timestamp", true))
+            val logJson = JSONObject().put("level", "debug").put("timestamp", true)
+            if (logPath.isNotEmpty()) logJson.put("output", logPath)
+            put("log", logJson)
             put("dns", dns)
             put("inbounds", JSONArray().put(tun))
             put("outbounds", obs)
@@ -131,7 +147,12 @@ object SingBoxConfig {
         return root.toString(2)
     }
 
-    fun build(key: VlessKey, settings: Repository, tunMtu: Int): String {
+    /**
+     * @param enableDpiBypass — направлять ли Zapret-сервисы через локальный
+     *   SOCKS+TLS-фраг (true для hybrid режима). false = чистый VPN, всё
+     *   через VLESS-туннель, никаких локальных DPI-обходов.
+     */
+    fun build(key: VlessKey, settings: Repository, tunMtu: Int, logPath: String = "", enableDpiBypass: Boolean = false): String {
 
         // Outbound vless
         val vless = JSONObject().apply {
@@ -193,6 +214,20 @@ object SingBoxConfig {
             put("stack", "mixed")
         }
 
+        // Inbound VPN-bridge — SOCKS5 на 127.0.0.1:9444. Наш DpiSocksServer
+        // использует его как fallback-путь в Happy Eyeballs race: открывает
+        // direct-сокет к Google (с фрагментацией) И параллельно socket к 9444
+        // (через VLESS-туннель). Первый пробивший выигрывает.
+        // Доступен только в VPN/Hybrid режимах (где есть VLESS-outbound).
+        val vpnBridge = JSONObject().apply {
+            put("type", "mixed")
+            put("tag", "vpn-bridge-in")
+            put("listen", "127.0.0.1")
+            put("listen_port", AmSalesVpnService.VPN_BRIDGE_PORT)
+            // КРИТИЧНО: sniff=false — иначе sing-box пытается читать TLS из
+            // сокета чтобы понять SNI, что блокирует наш byte-pipe.
+        }
+
         // DNS — два сервера:
         //  · remote: TLS DoH 1.1.1.1, идёт ЧЕРЕЗ прокси (detour=proxy)
         //  · local:  UDP 8.8.8.8, без detour — sing-box возьмёт default route
@@ -210,9 +245,13 @@ object SingBoxConfig {
         // вызывает аналогичную проверку.
         val dns = JSONObject().apply {
             put("servers", JSONArray()
+                // DoH (HTTPS) вместо DoT (TLS) — HTTP-запросы легче проходят
+                // через медленные/нестабильные туннели (короткий handshake,
+                // pipelining). DoT в нашем gRPC-VLESS падал с
+                // "context canceled" — Cloudflare не успевал ответить.
                 .put(JSONObject()
                     .put("tag", "remote")
-                    .put("type", "tls")
+                    .put("type", "https")
                     .put("server", "1.1.1.1")
                     .put("detour", "proxy"))
                 .put(JSONObject()
@@ -237,7 +276,7 @@ object SingBoxConfig {
             // youtube.com будет cloudflare-CDN из США через 1.1.1.1, и российский
             // провайдер всё равно увидит "запрос к YouTube" и заблокирует
             // независимо от того что мы делаем с TLS.
-            if (settings.useZapret) {
+            if (enableDpiBypass) {
                 val dpiDomainsForDns = JSONArray()
                 for (id in settings.dpiServices) {
                     val svc = com.amsales.vpn.data.DpiServices.byId(id) ?: continue
@@ -260,11 +299,19 @@ object SingBoxConfig {
         rules.put(JSONObject()
             .put("protocol", "dns")
             .put("action", "hijack-dns"))
+        // VPN-bridge inbound: всё что туда пришло идёт в VLESS-proxy.
+        // Это путь fallback для Happy Eyeballs в DpiSocksServer.
+        rules.put(JSONObject()
+            .put("inbound", JSONArray().put("vpn-bridge-in"))
+            .put("action", "route")
+            .put("outbound", "proxy"))
         // localhost (наш DPI-прокси) — direct, чтобы не зациклиться через VPN
         rules.put(JSONObject()
             .put("ip_cidr", JSONArray().put("127.0.0.0/8"))
             .put("action", "route")
             .put("outbound", "direct"))
+        // (package_name=com.amsales.vpn rule убран — мы добавили
+        // addDisallowedApplication в openTun, наш UID не идёт в TUN)
         // Блокировка рекламы YouTube/Google — action: reject (sing-box 1.13+)
         val adJsonMain = JSONArray()
         AD_DOMAINS.forEach { adJsonMain.put(it) }
@@ -305,21 +352,28 @@ object SingBoxConfig {
         // DPI-обход: выбранные пользователем сервисы (YouTube/Discord/etc)
         // идут НЕ через VPN и НЕ через direct, а через наш локальный
         // SOCKS5-прокси который фрагментирует TLS Client Hello.
-        // Учитываем мастер-toggle useZapret — если выключен, список игнорируется.
+        // enableDpiBypass=true только в hybrid-режиме.
         val dpiDomains = JSONArray()
-        if (settings.useZapret) {
+        if (enableDpiBypass) {
             for (id in settings.dpiServices) {
                 val svc = com.amsales.vpn.data.DpiServices.byId(id) ?: continue
                 for (d in svc.domains) dpiDomains.put(d)
             }
         }
         if (dpiDomains.length() > 0) {
+            // QUIC (UDP 443) → reject c method:default — ICMP unreachable,
+            // quic-go сразу падает на TCP. Без method = silent drop = бесконечный
+            // ретрай QUIC и TCP fallback не срабатывает.
+            rules.put(JSONObject()
+                .put("domain_suffix", dpiDomains)
+                .put("network", "udp")
+                .put("action", "reject")
+                .put("method", "default"))
+            // TCP → в DPI-bypass SOCKS
             rules.put(JSONObject()
                 .put("domain_suffix", dpiDomains)
                 .put("action", "route")
                 .put("outbound", "dpi-bypass"))
-            // IP-сервера VPN не должны ходить через DPI-обход
-            // (защита от случайного коллапса)
         }
 
         val route = JSONObject().apply {
@@ -344,26 +398,25 @@ object SingBoxConfig {
         // Блокировка делается через action: "reject" в route-правиле.
 
         // SOCKS5 outbound на наш локальный DPI-фрагментирующий прокси.
-        // Включаем только если есть выбранные DPI-сервисы и включён zapret.
-        val dpiBypass = if (settings.useZapret && settings.dpiServices.isNotEmpty()) {
+        // Включаем только если есть выбранные DPI-сервисы и включён dpi-bypass (hybrid режим).
+        val dpiBypass = if (enableDpiBypass && settings.dpiServices.isNotEmpty()) {
             JSONObject().apply {
                 put("type", "socks")
                 put("tag", "dpi-bypass")
                 put("server", "127.0.0.1")
                 put("server_port", AmSalesVpnService.DPI_PORT)
                 put("version", "5")
+                // TCP only — UDP/QUIC YouTube'а пойдёт через VPN-proxy
+                put("network", "tcp")
             }
         } else null
 
         val root = JSONObject().apply {
-            // info-уровень — увидим в логе попытки подключения к VLESS,
-            // DNS-разрешение, ошибки REALITY-handshake.
-            put("log", JSONObject()
-                .put("level", "debug")
-                .put("output", "stderr")
-                .put("timestamp", true))
+            val logJson = JSONObject().put("level", "debug").put("timestamp", true)
+            if (logPath.isNotEmpty()) logJson.put("output", logPath)
+            put("log", logJson)
             put("dns", dns)
-            put("inbounds", JSONArray().put(tun))
+            put("inbounds", JSONArray().put(tun).put(vpnBridge))
             val obs = JSONArray()
                 .put(vless)
                 .put(direct)

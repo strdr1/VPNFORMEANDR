@@ -11,7 +11,7 @@ import androidx.compose.runtime.staticCompositionLocalOf
  * Содержит:
  *  - profiles (список VLESS-ключей с метаданными)
  *  - currentProfileIndex
- *  - settings (флаги: routeRuDirect, useZapret, …)
+ *  - settings (флаги: routeRuDirect, …)
  *  - blacklistApps (split tunneling)
  */
 class Repository(private val context: Context) {
@@ -86,18 +86,21 @@ class Repository(private val context: Context) {
         get() = context.prefs().getBoolean("route_ru_direct", true)
         set(v) { context.prefs().edit().putBoolean("route_ru_direct", v).apply() }
 
-    /** Глобальный toggle: применять ли DPI-обход (zapret).
-     *  Если false — dpiServices игнорируются. Удобно для быстрого
-     *  on/off без потери списка сервисов. */
+    /** УСТАРЕЛО: раньше был мастер-toggle "обход DPI вкл/выкл".
+     *  Теперь DPI-обход определяется режимом VPN/Hybrid/Zapret (vpnMode).
+     *  Геттер оставлен для обратной совместимости с возможным старым кодом
+     *  и всегда возвращает true. Не использовать в новом коде. */
+    @Deprecated("use vpnMode instead")
     var useZapret: Boolean
-        get() = context.prefs().getBoolean("use_zapret", true)
-        set(v) { context.prefs().edit().putBoolean("use_zapret", v).apply() }
+        get() = true
+        set(_) { /* no-op */ }
 
     /** Режим работы кнопки на главном экране:
-     *   "vpn"  — полный VLESS-туннель + DPI + ad-block (как раньше)
-     *   "dpi"  — только DPI-обход и блокировка рекламы (без VPN).
-     *            Трафик идёт direct с российского IP, но YouTube без блокировок.
-     *            Не нужен заграничный сервер.
+     *   "vpn"     — полный VLESS-туннель + DPI + ad-block
+     *   "dpi"     — только DPI-обход (без VPN), трафик direct с RU IP
+     *   "hybrid"  — VPN+Zapret: всё через VLESS, КРОМЕ выбранных Zapret-сервисов
+     *               (они идут direct через TLS-фрагментацию). Быстрый YouTube
+     *               + защита VPN для остального.
      */
     var vpnMode: String
         get() = context.prefs().getString("vpn_mode", "vpn") ?: "vpn"
@@ -108,6 +111,13 @@ class Repository(private val context: Context) {
     var dpiServices: Set<String>
         get() = context.prefs().getStringSet("dpi_services", emptySet()) ?: emptySet()
         set(v) { context.prefs().edit().putStringSet("dpi_services", v.toHashSet()).apply() }
+
+    /** Стратегия фрагментации (см. TlsFragmenter):
+     *   0 — авто-перебор (по умолчанию)
+     *   1..12 — конкретная стратегия */
+    var dpiStrategy: Int
+        get() = context.prefs().getInt("dpi_strategy", 0)
+        set(v) { context.prefs().edit().putInt("dpi_strategy", v).apply() }
 
     var tgProxyLink: String
         get() = context.prefs().getString("tg_proxy_link", "") ?: ""
@@ -141,6 +151,13 @@ class Repository(private val context: Context) {
     var blacklistApps: Set<String>
         get() = store.blacklistApps
         set(v) { store.blacklistApps = v }
+
+    // ── Onboarding ──────────────────────────────────────────────────────
+
+    /** Показан ли уже welcome-onboarding. После первого "Готово" ставится true. */
+    var welcomeShown: Boolean
+        get() = context.prefs().getBoolean("welcome_shown", false)
+        set(v) { context.prefs().edit().putBoolean("welcome_shown", v).apply() }
 }
 
 private fun Context.prefs() = getSharedPreferences("amsales_vpn", Context.MODE_PRIVATE)

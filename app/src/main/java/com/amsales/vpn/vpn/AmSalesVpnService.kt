@@ -56,6 +56,7 @@ class AmSalesVpnService : VpnService() {
         const val TUN_ADDRESS = "172.19.0.1"
         const val TUN_MTU = 1500
         const val DPI_PORT = 8443  // локальный SOCKS5 для DPI-обхода
+        const val VPN_BRIDGE_PORT = 9444  // локальный SOCKS5 → VLESS-туннель (Happy Eyeballs fallback)
         private const val TAG = "AmSalesVpnService"
         private const val NOTIF_CHANNEL = "amsales_vpn_channel"
         private const val NOTIF_ID = 1
@@ -79,9 +80,13 @@ class AmSalesVpnService : VpnService() {
             ACTION_CONNECT -> scope.launch { connect() }
             ACTION_DISCONNECT -> scope.launch { disconnect() }
             ACTION_SWITCH_MODE -> scope.launch {
-                // Переключаем режим в настройках и перезапускаем сервис
+                // Цикл режимов: vpn → hybrid → dpi → vpn
                 val repo = Repository(applicationContext)
-                repo.vpnMode = if (repo.vpnMode == "vpn") "dpi" else "vpn"
+                repo.vpnMode = when (repo.vpnMode) {
+                    "vpn" -> "hybrid"
+                    "hybrid" -> "dpi"
+                    else -> "vpn"
+                }
                 disconnect()
                 kotlinx.coroutines.delay(300)
                 connect()
@@ -125,12 +130,13 @@ class AmSalesVpnService : VpnService() {
         try {
             val repo = Repository(applicationContext)
             val isDpiOnly = repo.vpnMode == "dpi"
+            val isHybrid = repo.vpnMode == "hybrid"
 
-            // В Zapret-режиме если юзер не выбрал ни одного сервиса —
-            // включаем YouTube по дефолту (иначе режим бесполезен).
-            if (isDpiOnly && repo.dpiServices.isEmpty()) {
+            // В DPI-only и Hybrid если юзер ничего не выбрал — авто-YouTube,
+            // иначе режимы бесполезны.
+            if ((isDpiOnly || isHybrid) && repo.dpiServices.isEmpty()) {
                 repo.dpiServices = setOf("youtube")
-                Log.i(TAG, "DPI-only mode: auto-selected YouTube")
+                Log.i(TAG, "mode=${repo.vpnMode}: auto-selected YouTube")
             }
 
             val key = if (isDpiOnly) {
@@ -143,7 +149,11 @@ class AmSalesVpnService : VpnService() {
                     return
                 }
             }
-            currentTag = if (isDpiOnly) "DPI-обход" else (key?.tag ?: "?")
+            currentTag = when {
+                isDpiOnly -> "DPI-обход"
+                isHybrid -> "VPN + Запрет (${key?.tag ?: "?"})"
+                else -> key?.tag ?: "?"
+            }
             VpnState.broadcast(applicationContext, "connecting", tag = currentTag)
 
             // 1. перенаправляем Go-stderr в файл (для Go-паник)
@@ -216,25 +226,39 @@ class AmSalesVpnService : VpnService() {
             }
             commandServer = server
 
-            // 4. Если есть DPI-сервисы (или DPI-only режим) — поднимаем
-            // локальный TLS-фрагментирующий SOCKS5-прокси.
-            // В DPI-only-режиме сервер обязателен (иначе режим бесполезен).
-            val needDpi = isDpiOnly || (repo.useZapret && repo.dpiServices.isNotEmpty())
+            // 4. Если режим DPI-only или Hybrid — поднимаем локальный
+            // TLS-фрагментирующий SOCKS5-прокси. В чистом VPN-режиме
+            // он не нужен — Zapret-сервисы пойдут через VLESS-туннель.
+            val needDpi = isDpiOnly || (isHybrid && repo.dpiServices.isNotEmpty())
             if (needDpi) {
                 stage("DPI SOCKS server start") {
-                    val ds = com.amsales.vpn.dpi.DpiSocksServer(DPI_PORT)
+                    // Применяем выбранную юзером стратегию (0 = авто-перебор)
+                    com.amsales.vpn.dpi.TlsFragmenter.currentStrategy = repo.dpiStrategy
+                    com.amsales.vpn.dpi.TlsFragmenter.resetGoodStrategy()
+                    Log.i(TAG, "DPI strategy: ${repo.dpiStrategy} (${com.amsales.vpn.dpi.TlsFragmenter.strategyName(repo.dpiStrategy)})")
+                    // Передаём this (VpnService) — DpiSocksServer вызовет
+                    // protect() на каждом upstream-сокете, чтобы он шёл
+                    // через wlan0 в обход нашего же TUN.
+                    // vpnBridgePort — только в Hybrid режиме (там VLESS активен).
+                    // В DPI-only нет VLESS-туннеля, race недоступен.
+                    val bridgePort = if (isHybrid) VPN_BRIDGE_PORT else null
+                    val ds = com.amsales.vpn.dpi.DpiSocksServer(DPI_PORT, this@AmSalesVpnService, bridgePort)
                     ds.start()
                     dpiServer = ds
                 }
             }
 
             // 5. собираем JSON-конфиг — VPN или DPI-only
+            // sing-box internal лог пишется в этот файл (stderr-redirect
+            // на gobind не работает — пишет в os.Stderr который не виден)
+            val singboxLogPath = File(applicationContext.filesDir, "singbox.log").absolutePath
             val json = if (isDpiOnly) {
-                SingBoxConfig.buildDpiOnly(repo, TUN_MTU)
+                SingBoxConfig.buildDpiOnly(repo, TUN_MTU, singboxLogPath)
             } else {
-                SingBoxConfig.build(key!!, repo, TUN_MTU)
+                SingBoxConfig.build(key!!, repo, TUN_MTU, singboxLogPath, enableDpiBypass = isHybrid)
             }
-            Log.d(TAG, "sing-box config (mode=${if (isDpiOnly) "DPI" else "VPN"}):\n$json")
+            val modeLabel = when { isDpiOnly -> "DPI"; isHybrid -> "VPN+ZAPRET"; else -> "VPN" }
+            Log.d(TAG, "sing-box config (mode=$modeLabel):\n$json")
 
             stage("Libbox.checkConfig") {
                 Libbox.checkConfig(json)
@@ -380,8 +404,17 @@ class AmSalesVpnService : VpnService() {
         )
 
         val repo = Repository(applicationContext)
-        val modeLabel = if (repo.vpnMode == "dpi") "Zapret" else "VPN"
-        val switchLabel = if (repo.vpnMode == "dpi") "Включить VPN" else "Zapret"
+        val modeLabel = when (repo.vpnMode) {
+            "dpi" -> "Zapret"
+            "hybrid" -> "VPN + Zapret"
+            else -> "VPN"
+        }
+        // Кнопка циклически перебирает 3 режима: VPN → Hybrid → Zapret → VPN
+        val switchLabel = when (repo.vpnMode) {
+            "vpn" -> "VPN+Zapret"
+            "hybrid" -> "Zapret"
+            else -> "VPN"
+        }
 
         return NotificationCompat.Builder(this, NOTIF_CHANNEL)
             .setSmallIcon(android.R.drawable.ic_lock_lock)

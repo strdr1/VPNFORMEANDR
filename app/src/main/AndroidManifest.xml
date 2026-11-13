@@ -24,6 +24,9 @@
         tools:ignore="QueryAllPackagesPermission"
         xmlns:tools="http://schemas.android.com/tools" />
 
+    <!-- Для авто-обновления: установка APK через PackageInstaller -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
     <application
         android:name=".App"
         android:allowBackup="true"
@@ -72,6 +75,17 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Local MTProto proxy bridge for Telegram" />
         </service>
+
+        <!-- FileProvider — для безопасной выдачи скачанного APK PackageInstaller'у -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_provider_paths" />
+        </provider>
 
         <!-- Авто-подключение при загрузке Android (опционально) -->
         <receiver

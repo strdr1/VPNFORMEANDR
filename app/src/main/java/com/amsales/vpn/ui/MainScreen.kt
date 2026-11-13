@@ -19,6 +19,7 @@ import androidx.compose.material.icons.outlined.PowerSettingsNew
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.VpnLock
 import androidx.compose.material.icons.outlined.Dns
+import androidx.compose.material.icons.outlined.HelpOutline
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -57,8 +58,58 @@ fun MainScreen(
         var tab by rememberSaveable { mutableIntStateOf(0) }
         val vpnState by rememberVpnState()
 
+        // Welcome onboarding — показываем один раз при первом запуске
+        var showWelcome by remember { mutableStateOf(!repository.welcomeShown) }
+        if (showWelcome) {
+            WelcomeScreen(onFinish = {
+                repository.welcomeShown = true
+                showWelcome = false
+            })
+            return@CompositionLocalProvider
+        }
+
+        // Help экран — открывается из кнопки ? в топбаре
+        var showHelp by rememberSaveable { mutableStateOf(false) }
+        if (showHelp) {
+            HelpScreen(onClose = { showHelp = false })
+            return@CompositionLocalProvider
+        }
+
+        // Авто-проверка обновлений при первом старте (раз в сессию)
+        var updateInfo by remember { mutableStateOf<com.amsales.vpn.update.UpdateChecker.UpdateInfo?>(null) }
+        LaunchedEffect(Unit) {
+            kotlinx.coroutines.delay(1500)  // не лезем сразу — пусть UI отрисуется
+            val info = com.amsales.vpn.update.UpdateChecker.check(com.amsales.vpn.BuildConfig.VERSION_NAME)
+            if (info != null) updateInfo = info
+        }
+        updateInfo?.let { info ->
+            com.amsales.vpn.update.UpdateDialog(
+                info = info,
+                currentVersion = com.amsales.vpn.BuildConfig.VERSION_NAME,
+                onDismiss = { updateInfo = null },
+            )
+        }
+
         Scaffold(
             containerColor = AmBgMid,
+            topBar = {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(AmBgTop)
+                        .padding(horizontal = 4.dp, vertical = 2.dp),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    IconButton(onClick = { showHelp = true }) {
+                        Icon(
+                            Icons.Outlined.HelpOutline,
+                            contentDescription = "Помощь",
+                            tint = AmAccent,
+                        )
+                    }
+                }
+            },
             bottomBar = { BottomBar(tab) { tab = it } }
         ) { padding ->
             Box(
@@ -171,7 +222,7 @@ private fun VpnTab(state: com.amsales.vpn.vpn.VpnUiState, onToggle: () -> Unit) 
 
         Spacer(Modifier.height(16.dp))
 
-        // Переключатель режима: VPN (полный туннель) / DPI (только обход без VPN)
+        // Переключатель режима: VPN / VPN+Zapret / Zapret
         Row(
             modifier = Modifier
                 .clip(RoundedCornerShape(20.dp))
@@ -186,7 +237,13 @@ private fun VpnTab(state: com.amsales.vpn.vpn.VpnUiState, onToggle: () -> Unit) 
                 onClick = { mode = "vpn"; repo.vpnMode = "vpn" }
             )
             ModeChip(
-                label = "Zapret",
+                label = "VPN+Запрет",
+                selected = mode == "hybrid",
+                enabled = !connected && !connecting,
+                onClick = { mode = "hybrid"; repo.vpnMode = "hybrid" }
+            )
+            ModeChip(
+                label = "Запрет",
                 selected = mode == "dpi",
                 enabled = !connected && !connecting,
                 onClick = { mode = "dpi"; repo.vpnMode = "dpi" }

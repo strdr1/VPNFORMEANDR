@@ -82,26 +82,52 @@ fun OptionsTab() {
         }
         Divider()
 
-        // Обход DPI — мастер-toggle + список сервисов
-        var zapretOn by remember { mutableStateOf(repo.useZapret) }
+        // Обход DPI — список сервисов и стратегия.
+        // Активируется автоматически в режимах "Запрет" и "VPN+Запрет"
+        // (выбираются на главном экране). В чистом "VPN" игнорируется.
         var dpiSet by remember { mutableStateOf(repo.dpiServices) }
-        ToggleRow(
-            title = "Обход DPI (zapret)",
-            subtitle = if (zapretOn && dpiSet.isEmpty())
-                "ВКЛЮЧЁН, но сервисы НЕ выбраны — отметь YouTube/Discord ниже"
-            else if (zapretOn)
-                "ВКЛЮЧЁН для ${dpiSet.size} сервис(ов). Переподключи VPN после изменений."
-            else
-                "ВЫКЛЮЧЕН. Сервисы ниже игнорируются.",
-            checked = zapretOn
+        var dpiStrategy by remember { mutableIntStateOf(repo.dpiStrategy) }
+
+        // Выбор стратегии фрагментации
+        Spacer(Modifier.height(12.dp))
+        Text(
+            "Стратегия обхода DPI",
+            color = AmTextHi, fontSize = 14.sp, fontWeight = FontWeight.Medium
+        )
+        Text(
+            "Если YouTube не открывается с одной — пробуй следующую. " +
+                "Авто-перебор сам выберет рабочую для твоей сети.",
+            color = AmTextLo, fontSize = 11.sp
+        )
+        Spacer(Modifier.height(8.dp))
+        // Скроллируемый row с чипами стратегий
+        androidx.compose.foundation.lazy.LazyRow(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier.fillMaxWidth()
         ) {
-            zapretOn = it
-            repo.useZapret = it
-            // Auto-select YouTube при первом включении если список пуст
-            if (it && dpiSet.isEmpty()) {
-                val auto = setOf("youtube")
-                dpiSet = auto
-                repo.dpiServices = auto
+            val items = (0..com.amsales.vpn.dpi.TlsFragmenter.STRATEGY_COUNT).toList()
+            items(items.size) { idx ->
+                val s = items[idx]
+                val selected = dpiStrategy == s
+                Surface(
+                    color = if (selected) AmAccent else AmBgTop,
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(14.dp))
+                        .clickable {
+                            dpiStrategy = s; repo.dpiStrategy = s
+                        }
+                ) {
+                    Text(
+                        text = if (s == 0) "Авто"
+                        else "$s. ${com.amsales.vpn.dpi.TlsFragmenter.strategyName(s)}",
+                        color = if (selected) AmBgTop else AmTextHi,
+                        fontSize = 11.sp,
+                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                        maxLines = 1
+                    )
+                }
             }
         }
         Divider()

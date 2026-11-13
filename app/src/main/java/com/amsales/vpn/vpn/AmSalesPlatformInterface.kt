@@ -114,9 +114,12 @@ class AmSalesPlatformInterface(
                 try { builder.addDisallowedApplication(pkg) }
                 catch (e: Exception) { Log.w(TAG, "skip $pkg: ${e.message}") }
             }
-            // ВАЖНО: НЕ добавляем addDisallowedApplication(packageName) —
-            // SagerNet этого не делает. Sing-box должен сам это сделать
-            // через excludePackage если нужно.
+            // НЕ исключаем себя через addDisallowedApplication —
+            // на MIUI это ломает ВЕСЬ TCP-трафик (странный side-effect:
+            // не только наш UID, а вся таблица маршрутов начинает
+            // игнорировать TCP). Вместо этого SOCKS-bridge защищает
+            // КАЖДЫЙ upstream-сокет через vpnService.protect(fd) после
+            // того как VpnService полностью activated.
         }
 
         val pfd = builder.establish()
@@ -325,7 +328,12 @@ class AmSalesPlatformInterface(
         // ConnectivityManager.registerDefaultNetworkCallback при регистрации
         // СРАЗУ синхронно зовёт onAvailable. В этот момент Go ещё может не
         // быть готов — пропускаем первые 2с.
-        val readyAt = System.currentTimeMillis() + 2000
+        // Раньше держали warmup=2000ms против SIGSEGV в Go. Теперь
+        // single-threaded executor + synchronized уже сериализуют
+        // вызовы безопасно — warmup можно убрать. Иначе первые 2 секунды
+        // sing-box не знает о wlan0 и валит все коннекты с
+        // "no available network interface".
+        val readyAt = System.currentTimeMillis() + 100
 
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
