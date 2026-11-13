@@ -22,25 +22,45 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import com.amsales.vpn.data.LocalRepository
+import com.amsales.vpn.data.ProxyKey
 import com.amsales.vpn.data.SubscriptionLoader
+import com.amsales.vpn.vpn.AmSalesVpnService
+import com.amsales.vpn.vpn.rememberVpnState
 import com.amsales.vpn.ui.theme.AmAccent
 import com.amsales.vpn.ui.theme.AmBgMid
 import com.amsales.vpn.ui.theme.AmBgTop
 import com.amsales.vpn.ui.theme.AmTextHi
 import com.amsales.vpn.ui.theme.AmTextLo
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.net.InetSocketAddress
+import java.net.Socket
+
+/** TCP-пинг (время рукопожатия), как «TCP ping» в Happ/v2rayN.
+ *  null — не ответил за 3 с. Для UDP-протоколов не меряем. */
+private fun tcpPing(host: String, port: Int): Long? = try {
+    val addr = InetSocketAddress(host, port)   // резолв до старта таймера
+    val t0 = System.nanoTime()
+    Socket().use { it.connect(addr, 3000) }
+    ((System.nanoTime() - t0) / 1_000_000).coerceAtLeast(1)
+} catch (_: Exception) {
+    null
+}
 
 /**
  * Вкладка «Серверы»:
- *  - список ключей (радио-выбор, копировать, share, удалить)
+ *  - «Авто» — sing-box сам держит самый быстрый живой сервер
+ *  - список ключей (радио-выбор, пинг, копировать, share, удалить)
  *  - «Добавить» открывает меню: «Вставить ключ/подписку», «Сканировать QR»
  *  - share показывает QR + текст ключа
  */
@@ -49,9 +69,39 @@ import kotlinx.coroutines.withContext
 fun ServersTab() {
     val repo = LocalRepository.current
     val clipboard = LocalClipboardManager.current
+    val ctx = LocalContext.current
+    val vpnState by rememberVpnState()
     val scope = rememberCoroutineScope()
     var profiles by remember { mutableStateOf(repo.profiles()) }
     var currentIdx by remember { mutableIntStateOf(repo.currentIndex()) }
+    var autoSelect by remember { mutableStateOf(repo.autoSelect) }
+    // "host:port" -> мс; -1 не ответил; отсутствует — не мерили
+    var pings by remember { mutableStateOf(mapOf<String, Long>()) }
+    var pinging by remember { mutableStateOf(false) }
+
+    // Смена сервера/режима при включённом VPN — сразу переподключаемся.
+    fun applySelection() {
+        if (vpnState.isOn || vpnState.isConnecting) {
+            ctx.startService(android.content.Intent(ctx, AmSalesVpnService::class.java)
+                .setAction(AmSalesVpnService.ACTION_RECONNECT))
+        }
+    }
+
+    fun pingAll() {
+        if (pinging) return
+        pinging = true
+        scope.launch {
+            val targets = profiles.mapNotNull { it.key }
+                .filter { !it.isUdp }
+                .map { it.host to it.port }
+                .distinct()
+            val results = withContext(Dispatchers.IO) {
+                targets.map { (h, p) -> async { "$h:$p" to (tcpPing(h, p) ?: -1L) } }.awaitAll()
+            }
+            pings = results.toMap()
+            pinging = false
+        }
+    }
     var addMenuOpen by remember { mutableStateOf(false) }
     var showPasteDialog by remember { mutableStateOf(false) }
     var showScanner by remember { mutableStateOf(false) }
@@ -69,7 +119,12 @@ fun ServersTab() {
                 onSuccess = { keys ->
                     val added = repo.addKeys(keys)
                     profiles = repo.profiles()
+                    // Подписка из нескольких серверов → по умолчанию «Авто».
+                    if (keys.size >= 2 && !autoSelect) {
+                        autoSelect = true; repo.autoSelect = true
+                    }
                     info = if (added == 1) "Добавлен 1 ключ" else "Добавлено: $added"
+                    pingAll()
                     error = null
                     showPasteDialog = false
                     showScanner = false
@@ -95,6 +150,12 @@ fun ServersTab() {
                 fontWeight = FontWeight.SemiBold,
                 modifier = Modifier.weight(1f)
             )
+            if (profiles.isNotEmpty()) {
+                TextButton(onClick = { pingAll() }, enabled = !pinging) {
+                    Text(if (pinging) "Пинг…" else "Пинг", color = AmAccent, fontSize = 13.sp)
+                }
+                Spacer(Modifier.width(4.dp))
+            }
             Box {
                 FilledTonalButton(
                     onClick = { addMenuOpen = true },
@@ -144,13 +205,45 @@ fun ServersTab() {
             EmptyState()
         } else {
             LazyColumn(Modifier.fillMaxSize()) {
+                if (profiles.size > 1) {
+                    item {
+                        AutoRow(
+                            isActive = autoSelect,
+                            activeName = if (autoSelect && vpnState.isOn)
+                                vpnState.activeTag.substringAfter("Авто → ", "").substringBefore(")")
+                            else "",
+                            onSelect = {
+                                if (!autoSelect) {
+                                    autoSelect = true; repo.autoSelect = true
+                                    applySelection()
+                                }
+                            }
+                        )
+                        HorizontalDivider(color = AmBgTop, thickness = 1.dp)
+                    }
+                }
                 itemsIndexed(profiles) { idx, p ->
+                    val k = p.key
                     ProfileRow(
                         name = p.name,
-                        host = p.host,
-                        isActive = idx == currentIdx,
+                        host = when {
+                            k == null -> "не удалось разобрать ключ"
+                            !k.isSupported -> "не поддерживается: ${k.unsupported}"
+                            else -> "${k.proto} · ${k.host}"
+                        },
+                        warn = k == null || !k.isSupported,
+                        ping = when {
+                            k == null -> null
+                            k.isUdp -> "udp"
+                            else -> pings["${k.host}:${k.port}"]?.let { if (it < 0) "—" else "$it мс" }
+                        },
+                        pingMs = k?.let { pings["${it.host}:${it.port}"] },
+                        isActive = !autoSelect && idx == currentIdx,
                         onSelect = {
+                            val changed = autoSelect || idx != currentIdx
                             currentIdx = idx; repo.setCurrentIndex(idx)
+                            autoSelect = false; repo.autoSelect = false
+                            if (changed) applySelection()
                         },
                         onCopy = { clipboard.setText(AnnotatedString(p.raw)) },
                         onShare = { shareKey = p.raw to p.name },
@@ -227,7 +320,7 @@ private fun EmptyState() {
         )
         Spacer(Modifier.height(8.dp))
         Text(
-            "Нажмите «Добавить» сверху, чтобы вставить vless://, подписку, happ:// или отсканировать QR-код.",
+            "Нажмите «Добавить» сверху, чтобы вставить ключ, подписку, happ:// или отсканировать QR-код.",
             color = AmTextLo, fontSize = 12.sp,
             textAlign = androidx.compose.ui.text.style.TextAlign.Center
         )
@@ -235,9 +328,45 @@ private fun EmptyState() {
 }
 
 @Composable
+private fun AutoRow(isActive: Boolean, activeName: String, onSelect: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onSelect() }
+            .padding(horizontal = 12.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            imageVector = if (isActive)
+                Icons.Outlined.RadioButtonChecked
+            else Icons.Outlined.RadioButtonUnchecked,
+            contentDescription = null,
+            tint = if (isActive) AmAccent else AmTextLo
+        )
+        Spacer(Modifier.width(10.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                "⚡ Авто — лучший сервер",
+                color = if (isActive) AmAccent else AmTextHi,
+                fontSize = 14.sp,
+                fontWeight = if (isActive) FontWeight.Medium else FontWeight.Normal
+            )
+            Text(
+                if (activeName.isNotEmpty()) "сейчас: $activeName"
+                else "сам переключится, если сервер умрёт",
+                color = AmTextLo, fontSize = 11.sp, maxLines = 1
+            )
+        }
+    }
+}
+
+@Composable
 private fun ProfileRow(
     name: String,
     host: String,
+    warn: Boolean,
+    ping: String?,
+    pingMs: Long?,
     isActive: Boolean,
     onSelect: () -> Unit,
     onCopy: () -> Unit,
@@ -266,7 +395,24 @@ private fun ProfileRow(
                 fontSize = 14.sp,
                 fontWeight = if (isActive) FontWeight.Medium else FontWeight.Normal
             )
-            Text(host, color = AmTextLo, fontSize = 11.sp, maxLines = 1)
+            Text(
+                host,
+                color = if (warn) androidx.compose.ui.graphics.Color(0xFFE8643C) else AmTextLo,
+                fontSize = 11.sp, maxLines = 1
+            )
+        }
+        if (ping != null) {
+            Text(
+                ping,
+                color = when {
+                    pingMs == null -> AmTextLo
+                    pingMs < 0 -> androidx.compose.ui.graphics.Color(0xFFE8643C)
+                    pingMs < 150 -> AmAccent
+                    pingMs < 400 -> androidx.compose.ui.graphics.Color(0xFFE8C33C)
+                    else -> androidx.compose.ui.graphics.Color(0xFFE8643C)
+                },
+                fontSize = 11.sp
+            )
         }
         IconButton(onClick = onShare) {
             Icon(Icons.Outlined.Share, null, tint = AmTextLo)
@@ -294,7 +440,7 @@ private fun AddKeyDialog(
     // Авто-вставка vless:// если он в clipboard
     LaunchedEffect(Unit) {
         val cb = clipboard.getText()?.text ?: ""
-        if (cb.startsWith("vless://", true) ||
+        if (ProxyKey.looksLikeKey(cb) ||
             cb.startsWith("happ://", true) ||
             cb.startsWith("https://", true)) {
             text = cb
@@ -310,7 +456,7 @@ private fun AddKeyDialog(
         text = {
             Column {
                 Text(
-                    "vless://… · https://… · happ://add/…",
+                    "vless · vmess · trojan · ss · hy2 · tuic · https://… · happ://add/…",
                     color = AmTextLo, fontSize = 11.sp
                 )
                 Spacer(Modifier.height(8.dp))

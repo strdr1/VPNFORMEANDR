@@ -24,7 +24,7 @@ class BootReceiver : BroadcastReceiver() {
 
         val repo = Repository(context)
         if (!repo.autoConnectOnBoot) return
-        if (repo.current()?.key == null) return
+        if (repo.serversForConnect().isEmpty() && repo.vpnMode != "dpi") return
 
         if (VpnService.prepare(context) == null) {
             val svc = Intent(context, AmSalesVpnService::class.java)

@@ -1,7 +1,7 @@
 package com.amsales.vpn.vpn
 
+import com.amsales.vpn.data.ProxyKey
 import com.amsales.vpn.data.Repository
-import com.amsales.vpn.data.VlessKey
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -14,12 +14,22 @@ import org.json.JSONObject
  * sing-box вызвал openTun платформенного интерфейса.
  *
  * Маршрутизация:
- *   - До VLESS-сервера (host из ключа) — direct
+ *   - До VPN-серверов (host из ключей) — direct
  *   - bypass-сайты пользователя — direct
  *   - .ru-домены — direct (если routeRuDirect=true)
- *   - всё остальное — proxy (vless)
+ *   - всё остальное — proxy (один сервер или urltest-группа «Авто»)
  */
 object SingBoxConfig {
+
+    /** clash API: приложение делает через него delay-тест и узнаёт, какой
+     *  сервер выбрал urltest. Только на 127.0.0.1. */
+    const val CLASH_API_PORT = 9097
+
+    /** URL для проверки связи (204 без тела) — и для urltest, и для нас. */
+    const val TEST_URL = "https://www.gstatic.com/generate_204"
+
+    /** Тег outbound'а сервера: один сервер — "proxy", в группе — "s<i>". */
+    fun serverTag(index: Int, count: Int) = if (count == 1) "proxy" else "s$index"
 
     /** YouTube/Google ads-домены — блокируем reject'ом в обоих режимах. */
     private val AD_DOMAINS = listOf(
@@ -152,53 +162,144 @@ object SingBoxConfig {
      *   SOCKS+TLS-фраг (true для hybrid режима). false = чистый VPN, всё
      *   через VLESS-туннель, никаких локальных DPI-обходов.
      */
-    fun build(key: VlessKey, settings: Repository, tunMtu: Int, logPath: String = "", enableDpiBypass: Boolean = false): String {
+    /** Outbound sing-box для одного сервера. */
+    fun outbound(k: ProxyKey, tag: String): JSONObject {
+        val ob = JSONObject()
+            .put("type", k.proto)
+            .put("tag", tag)
+            .put("server", k.host)
+            .put("server_port", k.port)
 
-        // Outbound vless
-        val vless = JSONObject().apply {
-            put("type", "vless")
-            put("tag", "proxy")
-            put("server", key.host)
-            put("server_port", key.port)
-            put("uuid", key.uuid)
-            put("packet_encoding", "xudp")
+        fun alpnArr() = JSONArray().also { a -> k.alpn.forEach { a.put(it) } }
 
-            if (key.security != "none" && key.security.isNotEmpty()) {
-                val tls = JSONObject().apply {
-                    put("enabled", true)
-                    if (key.sni.isNotEmpty()) put("server_name", key.sni)
-                    if (key.fp.isNotEmpty()) {
-                        put("utls", JSONObject()
-                            .put("enabled", true)
-                            .put("fingerprint", key.fp))
-                    }
-                    if (key.security == "reality") {
-                        val reality = JSONObject().apply {
-                            put("enabled", true)
-                            if (key.pbk.isNotEmpty()) put("public_key", key.pbk)
-                            if (key.sid.isNotEmpty()) put("short_id", key.sid)
-                        }
-                        put("reality", reality)
-                    }
-                }
-                put("tls", tls)
+        // TLS для vless/vmess/trojan (security=none → без TLS).
+        fun streamTls() {
+            if (k.security.isEmpty() || k.security == "none") return
+            val tls = JSONObject().put("enabled", true)
+                // server_name: sni, иначе host-заголовок (ws через CF — домен CF).
+                .put("server_name", k.sni.ifEmpty { k.hostHeader.ifEmpty { k.host } })
+            if (k.insecure) tls.put("insecure", true)
+            if (k.alpn.isNotEmpty()) tls.put("alpn", alpnArr())
+            // REALITY без uTLS не работает; для обычного TLS — только если задан fp.
+            val fp = k.fp.ifEmpty { if (k.security == "reality") "chrome" else "" }
+            if (fp.isNotEmpty()) {
+                tls.put("utls", JSONObject().put("enabled", true).put("fingerprint", fp))
             }
+            if (k.security == "reality") {
+                tls.put("reality", JSONObject()
+                    .put("enabled", true)
+                    .put("public_key", k.pbk)
+                    .put("short_id", k.sid))
+            }
+            ob.put("tls", tls)
+        }
 
-            when (key.type) {
-                "ws" -> {
-                    val tr = JSONObject()
-                        .put("type", "ws")
-                        .put("path", key.path)
-                    if (key.hostHeader.isNotEmpty()) {
-                        tr.put("headers", JSONObject().put("Host", key.hostHeader))
+        fun transport() {
+            val tr = when (k.type) {
+                "grpc" -> JSONObject().put("type", "grpc").apply {
+                    if (k.serviceName.isNotEmpty()) put("service_name", k.serviceName)
+                }
+                "ws" -> JSONObject().put("type", "ws").apply {
+                    var path = k.path
+                    // "/path?ed=2048" — early data в Sec-WebSocket-Protocol (как в xray).
+                    Regex("""[?&]ed=(\d+)""").find(path)?.let { m ->
+                        put("max_early_data", m.groupValues[1].toInt())
+                        put("early_data_header_name", "Sec-WebSocket-Protocol")
+                        path = path.removeRange(m.range)
                     }
-                    put("transport", tr)
+                    put("path", path.ifEmpty { "/" })
+                    // Host-заголовок (важно для Cloudflare-роутинга).
+                    put("headers", JSONObject().put("Host", k.hostHeader.ifEmpty { k.host }))
                 }
-                "grpc" -> {
-                    put("transport", JSONObject().put("type", "grpc"))
+                "httpupgrade" -> JSONObject().put("type", "httpupgrade").apply {
+                    if (k.path.isNotEmpty()) put("path", k.path)
+                    if (k.hostHeader.isNotEmpty()) put("host", k.hostHeader)
                 }
+                "http" -> JSONObject().put("type", "http").apply {
+                    if (k.path.isNotEmpty()) put("path", k.path)
+                    if (k.hostHeader.isNotEmpty()) put("host", JSONArray().put(k.hostHeader))
+                }
+                else -> return   // tcp — без transport
+            }
+            ob.put("transport", tr)
+        }
+
+        when (k.proto) {
+            "vless" -> {
+                ob.put("uuid", k.uuid)
+                // Vision работает только поверх голого TCP.
+                if (k.flow.isNotEmpty() && k.type == "tcp") ob.put("flow", k.flow)
+                ob.put("packet_encoding", "xudp")
+                streamTls(); transport()
+            }
+            "vmess" -> {
+                ob.put("uuid", k.uuid)
+                ob.put("security", k.vmessSecurity.takeIf { it.isNotEmpty() && it != "none" } ?: "auto")
+                ob.put("alter_id", k.alterId)
+                ob.put("packet_encoding", "xudp")
+                streamTls(); transport()
+            }
+            "trojan" -> {
+                ob.put("password", k.password)
+                streamTls(); transport()
+            }
+            "shadowsocks" -> {
+                ob.put("method", k.method)
+                ob.put("password", k.password)
+            }
+            "hysteria2" -> {
+                ob.put("password", k.password)
+                if (k.portRange.isNotEmpty()) {
+                    val ports = JSONArray()
+                    k.portRange.split(',').forEach { ports.put(it.replace('-', ':')) }
+                    ob.put("server_ports", ports)
+                }
+                if (k.obfs.isNotEmpty()) {
+                    ob.put("obfs", JSONObject().put("type", k.obfs).put("password", k.obfsPassword))
+                }
+                val tls = JSONObject().put("enabled", true).put("server_name", k.sni.ifEmpty { k.host })
+                if (k.insecure) tls.put("insecure", true)
+                if (k.alpn.isNotEmpty()) tls.put("alpn", alpnArr())
+                ob.put("tls", tls)
+            }
+            "tuic" -> {
+                ob.put("uuid", k.uuid)
+                ob.put("password", k.password)
+                if (k.congestion.isNotEmpty()) ob.put("congestion_control", k.congestion)
+                if (k.udpRelayMode.isNotEmpty()) ob.put("udp_relay_mode", k.udpRelayMode)
+                val tls = JSONObject().put("enabled", true)
+                    .put("server_name", k.sni.ifEmpty { k.host })
+                    .put("alpn", alpnArr())
+                if (k.insecure) tls.put("insecure", true)
+                ob.put("tls", tls)
             }
         }
+        return ob
+    }
+
+    /**
+     * @param keys — один сервер → outbound "proxy"; несколько → s0..sN и
+     *   urltest-группа "proxy" («Авто»: sing-box держит самый быстрый живой
+     *   сервер и сам переключается, если он умер).
+     */
+    fun build(
+        keys: List<ProxyKey>, settings: Repository, tunMtu: Int, logPath: String = "",
+        enableDpiBypass: Boolean = false, clashApi: Boolean = true,
+    ): String {
+        require(keys.isNotEmpty()) { "no servers" }
+        val serverOutbounds = keys.mapIndexed { i, k -> outbound(k, serverTag(i, keys.size)) }
+        val urlTest = if (keys.size > 1) {
+            val tags = JSONArray()
+            keys.indices.forEach { tags.put(serverTag(it, keys.size)) }
+            JSONObject()
+                .put("type", "urltest")
+                .put("tag", "proxy")
+                .put("outbounds", tags)
+                .put("url", TEST_URL)
+                .put("interval", "3m")
+                .put("tolerance", 80)
+                .put("idle_timeout", "30m")
+        } else null
 
         // Inbound TUN — без file_descriptor (libbox вызовет openTun через PlatformInterface)
         val tun = JSONObject().apply {
@@ -318,18 +419,26 @@ object SingBoxConfig {
         rules.put(JSONObject()
             .put("domain_suffix", adJsonMain)
             .put("action", "reject"))
-        // Exclude самого VPN-сервера. key.host может быть IP (45.92...)
-        // или доменом (для CF-Worker'а: amsales-vpn.danecc5678.workers.dev).
-        // ip_cidr принимает только IP — для домена используем domain.
-        val isIp = key.host.matches(Regex("""^[0-9.]+$|^[0-9a-fA-F:]+$"""))
-        if (isIp) {
+        // Exclude самих VPN-серверов. host может быть IP (2.26...) или
+        // доменом (CF-Worker). ip_cidr принимает только IP — для доменов domain.
+        val serverIps = JSONArray()
+        val serverDomains = JSONArray()
+        for (k in keys.map { it.host }.distinct()) {
+            when {
+                k.matches(Regex("""^[0-9.]+$""")) -> serverIps.put("$k/32")
+                k.contains(':') -> serverIps.put("$k/128")
+                else -> serverDomains.put(k)
+            }
+        }
+        if (serverIps.length() > 0) {
             rules.put(JSONObject()
-                .put("ip_cidr", JSONArray().put("${key.host}/32"))
+                .put("ip_cidr", serverIps)
                 .put("action", "route")
                 .put("outbound", "direct"))
-        } else {
+        }
+        if (serverDomains.length() > 0) {
             rules.put(JSONObject()
-                .put("domain", JSONArray().put(key.host))
+                .put("domain", serverDomains)
                 .put("action", "route")
                 .put("outbound", "direct"))
         }
@@ -418,11 +527,17 @@ object SingBoxConfig {
             put("dns", dns)
             put("inbounds", JSONArray().put(tun).put(vpnBridge))
             val obs = JSONArray()
-                .put(vless)
-                .put(direct)
+            serverOutbounds.forEach { obs.put(it) }
+            if (urlTest != null) obs.put(urlTest)
+            obs.put(direct)
             if (dpiBypass != null) obs.put(dpiBypass)
             put("outbounds", obs)
             put("route", route)
+            // clash API — delay-тест сквозь туннель и выбор urltest.
+            if (clashApi) {
+                put("experimental", JSONObject().put("clash_api", JSONObject()
+                    .put("external_controller", "127.0.0.1:$CLASH_API_PORT")))
+            }
         }
 
         return root.toString(2)

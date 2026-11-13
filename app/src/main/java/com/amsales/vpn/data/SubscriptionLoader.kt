@@ -6,10 +6,12 @@ import org.json.JSONObject
 import java.net.URL
 
 /**
- * Загрузка подписок (vless://...список) и парсинг happ://-ссылок.
+ * Загрузка подписок (список ключей) и парсинг happ://-ссылок.
  *
  * Поддерживаемые форматы:
- *   - vless://...                           → один ключ
+ *   - vless:// vmess:// trojan:// ss:// hysteria2:// hy2:// tuic://
+ *                                           → один или несколько ключей
+ *                                              (по одному на строку)
  *   - https://example.com/sub               → подписка (base64 список ИЛИ
  *                                              JSON outbounds[])
  *   - happ://add/<URL>                      → подписка с обёрткой
@@ -17,7 +19,7 @@ import java.net.URL
  *   - happ://crypt5/...                     → не поддерживается (требует
  *                                              реверса формата)
  *
- * Возвращает список найденных vless://-строк (может быть пустым).
+ * Возвращает список найденных ключей (может быть пустым).
  */
 object SubscriptionLoader {
 
@@ -27,12 +29,13 @@ object SubscriptionLoader {
         val trimmed = input.trim()
         if (trimmed.isEmpty()) return Result.failure(IllegalArgumentException("пустой ввод"))
 
-        // 1) Прямой vless://
-        if (trimmed.startsWith("vless://", ignoreCase = true)) {
-            return if (VlessKey.parse(trimmed) != null)
-                Result.success(listOf(trimmed))
+        // 1) Ключ (или несколько, через пробел/перевод строки)
+        if (ProxyKey.looksLikeKey(trimmed)) {
+            val keys = trimmed.split(Regex("\\s+")).filter { ProxyKey.parse(it) != null }
+            return if (keys.isNotEmpty())
+                Result.success(keys)
             else
-                Result.failure(IllegalArgumentException("неверный vless://-ключ"))
+                Result.failure(IllegalArgumentException("не удалось распознать ключ"))
         }
 
         // 2) happ://
@@ -47,7 +50,7 @@ object SubscriptionLoader {
         }
 
         return Result.failure(IllegalArgumentException(
-            "Поддерживаются: vless://, happ://add/, ссылка на подписку (https://...)"
+            "Поддерживаются: vless, vmess, trojan, ss, hysteria2, tuic, happ://add/, ссылка на подписку (https://...)"
         ))
     }
 
@@ -67,7 +70,7 @@ object SubscriptionLoader {
                 if (decoded.startsWith("http", ignoreCase = true)) {
                     return loadSubscription(decoded)
                 }
-                if (decoded.startsWith("vless://", ignoreCase = true)) {
+                if (ProxyKey.looksLikeKey(decoded)) {
                     return Result.success(listOf(decoded))
                 }
             } catch (_: Exception) {}
@@ -87,20 +90,18 @@ object SubscriptionLoader {
     private fun loadSubscription(url: String): Result<List<String>> {
         return try {
             val conn = URL(url).openConnection()
-            // Maskuем под Happ — многие сервисы фильтруют по UA.
-            conn.setRequestProperty("User-Agent", "Happ/1.0")
+            // UA клиента v2rayN: панели (Remnawave/Marzban/3x-ui) отдают на него
+            // обычный base64-список ссылок, а не JSON/YAML под конкретный клиент.
+            conn.setRequestProperty("User-Agent", "v2rayN/7.14.4")
             conn.connectTimeout = 10_000
             conn.readTimeout = 15_000
             val raw = conn.getInputStream().readBytes()
 
-            // Пробуем декодировать как base64 (если содержит vless://)
+            // Подписки часто закодированы base64 целиком.
             var data = raw
-            val maybeDecoded = try {
-                Base64.decode(String(raw).trim(),
-                    Base64.URL_SAFE or Base64.DEFAULT or Base64.NO_PADDING or Base64.NO_WRAP)
-            } catch (_: Exception) { null }
-            if (maybeDecoded != null && String(maybeDecoded).contains("vless://")) {
-                data = maybeDecoded
+            if (!String(raw).contains("://")) {
+                val decoded = ProxyKey.decodeB64(String(raw).trim())
+                if (String(decoded).contains("://")) data = decoded
             }
             val text = String(data, Charsets.UTF_8)
             val found = mutableListOf<String>()
@@ -108,7 +109,7 @@ object SubscriptionLoader {
             // Plain-список (по строкам)
             text.split('\n', '\r').forEach { line ->
                 val s = line.trim()
-                if (s.startsWith("vless://", ignoreCase = true)) found += s
+                if (ProxyKey.looksLikeKey(s) && ProxyKey.parse(s) != null && s !in found) found += s
             }
 
             // JSON-конфиг (xray/sing-box format от Happ-style сервисов)
@@ -149,7 +150,7 @@ object SubscriptionLoader {
             }
             if (real.isEmpty()) {
                 return Result.failure(IllegalArgumentException(
-                    "В подписке не найдено ключей vless"
+                    "В подписке не найдено ключей"
                 ))
             }
             Result.success(real)

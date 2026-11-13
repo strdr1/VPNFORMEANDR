@@ -1,6 +1,6 @@
 # AM.SALES VPN — Android
 
-Мобильный клиент к нашему серверу `78.17.103.241` + Cloudflare Worker.
+Мобильный клиент к нашему серверу `2.26.160.187` (с 2026-11, старый `78.17.103.241` заблокирован) и любым подпискам: vless, vmess, trojan, ss, hysteria2, tuic; режим «Авто» выбирает лучший живой сервер.
 Стек: Kotlin + Jetpack Compose + Android VpnService + sing-box.
 
 ## Этапы
@@ -51,7 +51,7 @@
        ↓ VLESS+REALITY / VLESS+WS
 [Cloudflare Worker amsales-vpn.danecc5678.workers.dev]  (для AM.SALES-CF)
        или прямо
-[78.17.103.241:443]                                     (для AM.SALES-1/2)
+[2.26.160.187:443]                                      (для AM.SALES-1/2)
        ↓
 [Интернет]
 ```

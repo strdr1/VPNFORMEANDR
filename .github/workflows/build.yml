@@ -34,29 +34,48 @@ jobs:
             ~/.gradle/wrapper
           key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
 
-      - name: Build debug APK
+      # Постоянный ключ подписи из секретов. Без него обновление поверх
+      # установленной версии не встаёт (каждый раннер — свой debug-ключ).
+      # В pull_request секретов нет — там собирается только debug.
+      - name: Release keystore
+        if: github.event_name != 'pull_request'
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "ANDROID_KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+
+      - name: Build APK
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: |
           chmod +x ./gradlew
-          ./gradlew assembleDebug --no-daemon --stacktrace
-
-      - name: Find APK
-        id: apk
-        run: |
-          path=$(find app/build/outputs/apk/debug -name '*.apk' | head -1)
-          echo "path=$path" >> "$GITHUB_OUTPUT"
-          echo "name=$(basename "$path")" >> "$GITHUB_OUTPUT"
-          ls -la app/build/outputs/apk/debug/
+          if [ -n "$ANDROID_KEYSTORE_FILE" ]; then
+            ./gradlew assembleRelease --no-daemon --stacktrace
+            dir=app/build/outputs/apk/release
+          else
+            ./gradlew assembleDebug --no-daemon --stacktrace
+            dir=app/build/outputs/apk/debug
+          fi
+          ver=$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts)
+          mkdir -p out
+          cp "$(find "$dir" -name '*.apk' | head -1)" "out/AmSalesVPN-$ver.apk"
+          ls -la out
+          # Чем подписан (для сверки отпечатка с ключом в F:\1\Star\server\android-release).
+          bt=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$bt/apksigner" verify --print-certs out/*.apk | grep -E "SHA-256|Signer" || true
 
       - name: Upload APK as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AmSalesVPN-debug
-          path: ${{ steps.apk.outputs.path }}
+          name: AmSalesVPN
+          path: out/*.apk
 
       # Если пушим tag vX.Y.Z — создаём GitHub Release и заливаем APK
+      # (приложение берёт обновления из releases/latest).
       - name: Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.apk.outputs.path }}
+          files: out/*.apk
           generate_release_notes: true

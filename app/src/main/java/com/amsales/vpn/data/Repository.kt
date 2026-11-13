@@ -9,8 +9,8 @@ import androidx.compose.runtime.staticCompositionLocalOf
  * добавим DataStore если понадобится reactive.
  *
  * Содержит:
- *  - profiles (список VLESS-ключей с метаданными)
- *  - currentProfileIndex
+ *  - profiles (список ключей с метаданными)
+ *  - currentProfileIndex / autoSelect («Авто» — лучший живой сервер)
  *  - settings (флаги: routeRuDirect, …)
  *  - blacklistApps (split tunneling)
  */
@@ -18,24 +18,63 @@ class Repository(private val context: Context) {
 
     private val store = Settings(context)
 
+    init {
+        migrateServerAddress()
+    }
+
     // ── Профили ─────────────────────────────────────────────────────────
 
     data class Profile(
         val raw: String,
-        val key: VlessKey?    // распарсенный, null = битый ключ
+        val key: ProxyKey?    // распарсенный, null = битый ключ
     ) {
         val name: String get() = key?.tag ?: "?"
         val host: String get() = key?.host ?: "?"
     }
 
-    fun profiles(): List<Profile> = store.keys.map { Profile(it, VlessKey.parse(it)) }
+    fun profiles(): List<Profile> = store.keys.map { Profile(it, ProxyKey.parse(it)) }
 
     fun currentIndex(): Int = store.currentKeyIndex
     fun setCurrentIndex(i: Int) { store.currentKeyIndex = i }
     fun current(): Profile? = profiles().getOrNull(currentIndex())
 
+    /** «Авто»: все серверы в urltest-группе, sing-box держит лучший живой. */
+    var autoSelect: Boolean
+        get() = context.prefs().getBoolean("auto_select", true)
+        set(v) { context.prefs().edit().putBoolean("auto_select", v).apply() }
+
+    /**
+     * Серверы, которые пойдут в конфиг при текущем режиме.
+     * «Авто» и ≥2 рабочих ключа → все рабочие, кроме выходов в России
+     * (их берём, только если других нет). Иначе — выбранный ключ.
+     */
+    fun serversForConnect(): List<ProxyKey> {
+        val supported = profiles().mapNotNull { it.key }.filter { it.isSupported }
+        if (autoSelect && supported.size >= 2) {
+            val (ru, other) = supported.partition { it.isRuExit }
+            return other.ifEmpty { ru }
+        }
+        if (autoSelect && supported.size == 1) return supported
+        val cur = current()?.key ?: return emptyList()
+        return if (cur.isSupported) listOf(cur) else emptyList()
+    }
+
+    /**
+     * AM.SALES переехал с 78.17.103.241 (заблокирован РКН) на 2.26.160.187.
+     * UUID и REALITY-ключи те же — достаточно поменять адрес в сохранённых
+     * ключах (включая SNI вида 78-17-103-241.nip.io).
+     */
+    private fun migrateServerAddress() {
+        val old = store.keys
+        val migrated = old.map {
+            it.replace("78.17.103.241", "2.26.160.187")
+              .replace("78-17-103-241.nip.io", "2-26-160-187.nip.io")
+        }
+        if (migrated != old) store.keys = migrated
+    }
+
     fun addKey(uri: String): Boolean {
-        if (VlessKey.parse(uri) == null) return false
+        if (ProxyKey.parse(uri) == null) return false
         store.keys = store.keys + uri
         return true
     }
@@ -45,7 +84,7 @@ class Repository(private val context: Context) {
         val current = store.keys.toMutableList()
         var added = 0
         for (uri in uris) {
-            if (VlessKey.parse(uri) == null) continue
+            if (ProxyKey.parse(uri) == null) continue
             if (uri in current) continue
             current += uri
             added++
@@ -70,7 +109,7 @@ class Repository(private val context: Context) {
     }
 
     fun replaceAt(index: Int, uri: String): Boolean {
-        if (VlessKey.parse(uri) == null) return false
+        if (ProxyKey.parse(uri) == null) return false
         val list = store.keys.toMutableList()
         if (index !in list.indices) return false
         list[index] = uri

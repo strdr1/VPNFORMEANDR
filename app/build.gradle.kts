@@ -12,8 +12,8 @@ android {
         applicationId = "com.amsales.vpn"
         minSdk = 24       // Android 7.0 — VpnService.addDisallowedApplication работает с API 21+
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
 
         // Собираем APK только для ARM (arm64 + armv7). На x86-эмуляторе
         // запускать смысла нет — у юзера телефоны.
@@ -29,17 +29,33 @@ android {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
     }
 
+    // Постоянный ключ подписи: без него каждая сборка CI подписана случайным
+    // debug-ключом раннера, и обновление поверх установленной версии не
+    // встаёт. Файл и пароль приходят из секретов GitHub (см. build.yml);
+    // локально без них release подписывается debug-ключом.
+    val releaseKeystore = System.getenv("ANDROID_KEYSTORE_FILE")
+    signingConfigs {
+        if (releaseKeystore != null) {
+            create("release") {
+                storeFile = file(releaseKeystore)
+                storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = "amsales"
+                keyPassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         debug {
             isMinifyEnabled = false
-            // Подпись — debug-кейстор Android SDK (по умолчанию). GitHub Actions
-            // соберёт APK с этой подписью — ставится на любой Android вручную.
             applicationIdSuffix = ""
         }
         release {
             isMinifyEnabled = false
-            // Пока тоже debug-подпись — позже сменим на release-keystore.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (releaseKeystore != null)
+                signingConfigs.getByName("release")
+            else
+                signingConfigs.getByName("debug")
         }
     }
 

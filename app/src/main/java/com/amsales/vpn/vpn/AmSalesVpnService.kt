@@ -13,6 +13,7 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.amsales.vpn.R
+import com.amsales.vpn.data.ProxyKey
 import com.amsales.vpn.data.Repository
 import com.amsales.vpn.ui.MainActivity
 import io.nekohasekai.libbox.CommandServer
@@ -29,20 +30,26 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.Proxy
+import java.net.URL
+import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * VpnService с реальным sing-box-движком внутри (libbox).
  *
  * Поток запуска:
- *   1. Repo даёт активный VlessKey
+ *   1. Repo даёт серверы для подключения (выбранный или все — «Авто»)
  *   2. Libbox.setup(basePath/workingPath/tempPath) — кладём данные в files/sing-box
- *   3. SingBoxConfig.build(key, repo) → JSON
+ *   3. SingBoxConfig.build(servers, repo) → JSON
  *   4. AmSalesPlatformInterface — мост, отдающий TUN-fd через openTun()
  *   5. Libbox.newCommandServer(handler, platform) + server.start()
  *   6. server.startOrReloadService(json, null) — запуск sing-box-инстанса
- *   7. broadcast "on"
+ *   7. broadcast "on", затем delay-тест сквозь туннель (clash API): если
+ *      трафик не идёт ни через один сервер — отключаемся с ошибкой
  *
  * Stop:
  *   - server.closeService(); server.close(); закрываем TUN.
@@ -53,6 +60,8 @@ class AmSalesVpnService : VpnService() {
         const val ACTION_CONNECT = "com.amsales.vpn.CONNECT"
         const val ACTION_DISCONNECT = "com.amsales.vpn.DISCONNECT"
         const val ACTION_SWITCH_MODE = "com.amsales.vpn.SWITCH_MODE"
+        /** Переподключиться с текущими настройками (смена сервера / «Авто»). */
+        const val ACTION_RECONNECT = "com.amsales.vpn.RECONNECT"
         const val TUN_ADDRESS = "172.19.0.1"
         const val TUN_MTU = 1500
         const val DPI_PORT = 8443  // локальный SOCKS5 для DPI-обхода
@@ -70,6 +79,8 @@ class AmSalesVpnService : VpnService() {
     private var platformInterface: AmSalesPlatformInterface? = null
     private var dpiServer: com.amsales.vpn.dpi.DpiSocksServer? = null
     private var statsJob: Job? = null
+    private var checkJob: Job? = null
+    private var activeServers: List<ProxyKey> = emptyList()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var currentTag: String = ""
     private var rxBaseline: Long = 0L
@@ -79,6 +90,12 @@ class AmSalesVpnService : VpnService() {
         when (intent?.action) {
             ACTION_CONNECT -> scope.launch { connect() }
             ACTION_DISCONNECT -> scope.launch { disconnect() }
+            ACTION_RECONNECT -> scope.launch {
+                if (!isRunning) return@launch
+                disconnect()
+                delay(300)
+                connect()
+            }
             ACTION_SWITCH_MODE -> scope.launch {
                 // Цикл режимов: vpn → hybrid → dpi → vpn
                 val repo = Repository(applicationContext)
@@ -139,20 +156,28 @@ class AmSalesVpnService : VpnService() {
                 Log.i(TAG, "mode=${repo.vpnMode}: auto-selected YouTube")
             }
 
-            val key = if (isDpiOnly) {
-                null  // DPI-only режим не требует VLESS-ключа
-            } else {
-                repo.current()?.key ?: run {
-                    VpnState.broadcast(applicationContext, "error",
-                        error = "Сначала добавьте ключ на вкладке Серверы")
-                    stopSelf()
-                    return
-                }
+            // DPI-only режим не требует ключей.
+            val servers = if (isDpiOnly) emptyList() else repo.serversForConnect()
+            if (!isDpiOnly && servers.isEmpty()) {
+                val cur = repo.current()?.key
+                VpnState.broadcast(applicationContext, "error", error = when {
+                    repo.profiles().isEmpty() -> "Сначала добавьте ключ на вкладке Серверы"
+                    cur != null && !cur.isSupported ->
+                        "Сервер «${cur.tag}» использует «${cur.unsupported}» — это не поддерживается. Выберите другой сервер или «Авто»"
+                    else -> "Нет серверов, которые поддерживает приложение"
+                })
+                stopSelf()
+                return
+            }
+            activeServers = servers
+            val serversLabel = when {
+                servers.size > 1 -> "Авто"
+                else -> servers.firstOrNull()?.tag ?: "?"
             }
             currentTag = when {
                 isDpiOnly -> "DPI-обход"
-                isHybrid -> "VPN + Запрет (${key?.tag ?: "?"})"
-                else -> key?.tag ?: "?"
+                isHybrid -> "VPN + Запрет ($serversLabel)"
+                else -> serversLabel
             }
             VpnState.broadcast(applicationContext, "connecting", tag = currentTag)
 
@@ -252,14 +277,27 @@ class AmSalesVpnService : VpnService() {
             // sing-box internal лог пишется в этот файл (stderr-redirect
             // на gobind не работает — пишет в os.Stderr который не виден)
             val singboxLogPath = File(applicationContext.filesDir, "singbox.log").absolutePath
-            val json = if (isDpiOnly) {
+            var json = if (isDpiOnly) {
                 SingBoxConfig.buildDpiOnly(repo, TUN_MTU, singboxLogPath)
             } else {
-                SingBoxConfig.build(key!!, repo, TUN_MTU, singboxLogPath, enableDpiBypass = isHybrid)
+                SingBoxConfig.build(servers, repo, TUN_MTU, singboxLogPath, enableDpiBypass = isHybrid)
             }
             val modeLabel = when { isDpiOnly -> "DPI"; isHybrid -> "VPN+ZAPRET"; else -> "VPN" }
             Log.d(TAG, "sing-box config (mode=$modeLabel):\n$json")
 
+            // Если libbox собран без clash API, конфиг с ним не пройдёт
+            // проверку — тогда работаем без него и без проверки связи.
+            var clashApi = !isDpiOnly
+            try {
+                Libbox.checkConfig(json)
+            } catch (e: Exception) {
+                if (clashApi && e.message.orEmpty().contains("clash", ignoreCase = true)) {
+                    Log.w(TAG, "clash API unavailable, connecting without tunnel check: ${e.message}")
+                    clashApi = false
+                    json = SingBoxConfig.build(servers, repo, TUN_MTU, singboxLogPath,
+                        enableDpiBypass = isHybrid, clashApi = false)
+                }
+            }
             stage("Libbox.checkConfig") {
                 Libbox.checkConfig(json)
             }
@@ -290,6 +328,8 @@ class AmSalesVpnService : VpnService() {
             startStatsWatcher()
 
             VpnState.broadcast(applicationContext, "on", tag = currentTag)
+            // В DPI-only нет прокси-outbound и clash API — проверять нечего.
+            if (clashApi) startTunnelCheck(isHybrid)
         } catch (e: Throwable) {
             Log.e(TAG, "connect failed", e)
             VpnState.broadcast(applicationContext, "error",
@@ -318,9 +358,89 @@ class AmSalesVpnService : VpnService() {
         }
     }
 
+    // ── Проверка связи сквозь туннель ───────────────────────────────────
+    //
+    // TUN сам подтверждает TCP-рукопожатия локально, поэтому «процесс
+    // запущен» ещё не значит «трафик идёт». Делаем настоящий HTTP-запрос
+    // через outbound "proxy" (clash API delay). В «Авто» первая попытка
+    // сначала перемеряет всю группу, чтобы urltest ушёл с мёртвого сервера.
+    // 3 неудачи подряд → отключаемся с ошибкой, чтобы вернуть интернет.
+
+    private fun clashGet(path: String, timeoutMs: Int): String? = try {
+        val conn = URL("http://127.0.0.1:${SingBoxConfig.CLASH_API_PORT}$path")
+            .openConnection(Proxy.NO_PROXY) as HttpURLConnection
+        conn.connectTimeout = 3000
+        conn.readTimeout = timeoutMs
+        try {
+            if (conn.responseCode == 200) conn.inputStream.bufferedReader().readText() else null
+        } finally {
+            conn.disconnect()
+        }
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun proxyDelay(groupTest: Boolean): Int {
+        val q = "?url=" + URLEncoder.encode(SingBoxConfig.TEST_URL, "UTF-8") + "&timeout=6000"
+        // Ответ группы не показателен (пока идёт её собственная проверка,
+        // sing-box отдаёт {}), решение — по delay самого "proxy".
+        if (groupTest) clashGet("/group/proxy/delay$q", 15_000)
+        val body = clashGet("/proxies/proxy/delay$q", 9_000) ?: return 0
+        return try { JSONObject(body).optInt("delay", 0) } catch (_: Exception) { 0 }
+    }
+
+    /** Какой сервер сейчас несёт трафик (для «Авто» — выбор urltest). */
+    private fun refreshActiveTag(isHybrid: Boolean) {
+        val servers = activeServers
+        val name = if (servers.size <= 1) {
+            servers.firstOrNull()?.tag
+        } else {
+            val now = clashGet("/proxies/proxy", 4000)?.let {
+                try { JSONObject(it).optString("now") } catch (_: Exception) { "" }
+            }.orEmpty()
+            now.removePrefix("s").toIntOrNull()?.let { servers.getOrNull(it)?.tag }
+        } ?: return
+        val label = if (servers.size > 1) "Авто → $name" else name
+        currentTag = if (isHybrid) "VPN + Запрет ($label)" else label
+        VpnState.broadcast(applicationContext, "on", tag = currentTag)
+    }
+
+    private fun startTunnelCheck(isHybrid: Boolean) {
+        checkJob?.cancel()
+        checkJob = scope.launch {
+            delay(2500)
+            for (attempt in 0 until 3) {
+                if (!isRunning) return@launch
+                val d = proxyDelay(groupTest = activeServers.size > 1 && attempt == 0)
+                if (d > 0) {
+                    Log.i(TAG, "tunnel check OK: ${d}ms")
+                    refreshActiveTag(isHybrid)
+                    // urltest называет выбранный сервер только когда домерит
+                    // все (мёртвые — по таймауту) — уточняем имя чуть позже.
+                    if (activeServers.size > 1) {
+                        delay(8000)
+                        if (isRunning) refreshActiveTag(isHybrid)
+                    }
+                    return@launch
+                }
+                delay(2000)
+            }
+            if (!isRunning) return@launch
+            val many = activeServers.size > 1
+            Log.w(TAG, "tunnel check failed — disconnecting")
+            disconnect()
+            VpnState.broadcast(applicationContext, "error", error = if (many)
+                "Ни один сервер не ответил. Обновите подписку или попробуйте другой интернет (Wi-Fi/мобильный)."
+            else
+                "Сервер «${activeServers.firstOrNull()?.tag ?: "?"}» не пропускает трафик. Выберите другой сервер или «Авто».")
+        }
+    }
+
     private suspend fun disconnect() {
         if (!isRunning && commandServer == null) return
         try {
+            checkJob?.let { if (it != kotlinx.coroutines.currentCoroutineContext()[Job]) it.cancel() }
+            checkJob = null
             statsJob?.cancel(); statsJob = null
             cleanup()
             stopForeground(STOP_FOREGROUND_REMOVE)
